@@ -376,4 +376,4 @@ When genuinely finished, give me only a concise report containing:
 - known limitations
 - worthwhile future improvements
 
-Do the implementation, not another implementation proposal.
+Do the implementation, not another implementation proposal. use pkexec when sudo password is needed
