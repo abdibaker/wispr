@@ -2,6 +2,7 @@
 use anyhow::{anyhow, Result};
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::{Context, FlagSet, State};
+use libpulse_binding::def::BufferAttr;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::Direction;
@@ -36,6 +37,15 @@ impl Recording {
         level: impl Fn(f32) + Send + 'static,
     ) -> Result<Self> {
         let device = (!device.is_empty()).then(|| device.to_string());
+        let chunk_bytes = RATE / 20 * 2;
+        // pipewire-pulse defaults fragsize to ~2 s, delaying the first read (and the level meter) by that much.
+        let attr = BufferAttr {
+            maxlength: u32::MAX,
+            tlength: u32::MAX,
+            prebuf: u32::MAX,
+            minreq: u32::MAX,
+            fragsize: chunk_bytes,
+        };
         let simple = Simple::new(
             None,
             "Voice Prompt",
@@ -44,14 +54,14 @@ impl Recording {
             "dictation",
             &spec(),
             None,
-            None,
+            Some(&attr),
         )
         .map_err(|e| anyhow!("Microphone unavailable: {e}"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
         let handle = std::thread::spawn(move || {
             let mut samples: Vec<i16> = Vec::with_capacity(RATE as usize * 10);
-            let mut chunk = vec![0u8; (RATE / 20 * 2) as usize];
+            let mut chunk = vec![0u8; chunk_bytes as usize];
             let max = (RATE as u64 * max_secs) as usize;
             while !stop_flag.load(Ordering::Relaxed) && samples.len() < max {
                 simple
