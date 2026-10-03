@@ -725,18 +725,10 @@ fn main() {
             diagnostics
         ])
         .setup(setup)
-        .on_window_event(|window, event| {
-            // Closing settings keeps the app running in the tray.
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
-            }
-        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_, event| {
+            // Closing settings keeps the app running in the tray.
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 if code.is_none() {
                     api.prevent_exit();
