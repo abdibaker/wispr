@@ -1,0 +1,10 @@
+[Desktop Entry]
+Categories={{categories}}
+Comment={{comment}}
+Exec={{exec}}
+StartupWMClass={{exec}}
+Icon={{icon}}
+Name=Voice Prompt
+Keywords=dictation;voice;speech;prompt;
+Terminal=false
+Type=Application
