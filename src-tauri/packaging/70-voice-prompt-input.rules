@@ -1,0 +1,3 @@
+# Push-to-talk reads key state from /dev/input/event*. TAG+="uaccess" grants the
+# active logind session read access; the input group + 0660 is the fallback.
+SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess", GROUP="input", MODE="0660"

@@ -19,9 +19,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "deb"
-    ],
+    "targets": ["deb"],
     "category": "Utility",
     "shortDescription": "Push-to-talk prompt dictation",
     "longDescription": "Hold a shortcut, speak, release: the cleaned-up prompt is typed into the focused app.",
@@ -39,7 +37,8 @@
           "gnome-keyring | org.freedesktop.secrets"
         ],
         "files": {
-          "/usr/share/icons/hicolor/scalable/apps/voice-prompt.svg": "icons/icon.svg"
+          "/usr/share/icons/hicolor/scalable/apps/voice-prompt.svg": "icons/icon.svg",
+          "/usr/lib/udev/rules.d/70-voice-prompt-input.rules": "packaging/70-voice-prompt-input.rules"
         },
         "postInstallScript": "packaging/postinst.sh",
         "postRemoveScript": "packaging/postrm.sh",

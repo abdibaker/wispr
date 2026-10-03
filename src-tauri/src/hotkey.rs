@@ -1,13 +1,14 @@
 //! HotkeyManager: push-to-talk via evdev key state.
 //!
-//! COSMIC's xdg-desktop-portal does not implement GlobalShortcuts (and the portal has no
-//! key-release semantics anyway), so we read key state from /dev/input. This needs the user
-//! to be in the `input` group. Only key up/down state is kept; key codes are never logged.
+//! COSMIC's xdg-desktop-portal does not implement the GlobalShortcuts portal
+//! (pop-os/xdg-desktop-portal-cosmic#4), so we read key state from /dev/input. Read access
+//! comes from the shipped uaccess udev rule (or the `input` group fallback). Only key
+//! up/down state is kept; key codes are never logged.
+//! See docs/research-cosmic-global-shortcuts.md.
 use anyhow::{bail, Result};
 use evdev::{Device, EventSummary, KeyCode};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -109,7 +110,6 @@ impl Tracker {
 
 pub struct HotkeyManager {
     chord: Arc<Mutex<Chord>>,
-    held: Arc<AtomicUsize>,
 }
 
 impl HotkeyManager {
@@ -118,12 +118,10 @@ impl HotkeyManager {
         let chord = Arc::new(Mutex::new(parse(shortcut)?));
         let (sender, receiver) = channel::<(String, KeyCode, bool)>();
         if keyboards().is_empty() {
-            bail!("No readable keyboard in /dev/input. Add your user to the 'input' group and log in again.");
+            bail!("No readable keyboard in /dev/input. Re-login, or add your user to the 'input' group and log in again.");
         }
         std::thread::spawn(move || watch_devices(sender));
         let tracker_chord = chord.clone();
-        let held = Arc::new(AtomicUsize::new(0));
-        let tracker_held = held.clone();
         std::thread::spawn(move || {
             let mut tracker = Tracker::new();
             // Per-device key state so a device unplugged mid-chord cannot leave keys stuck.
@@ -131,7 +129,7 @@ impl HotkeyManager {
             for (device, key, down) in receiver {
                 if key == KeyCode::KEY_RESERVED {
                     for stale in per_device.remove(&device).unwrap_or_default() {
-                        let chord = tracker_chord.lock().unwrap().clone();
+                        let chord = tracker_chord.lock().unwrap();
                         if let Some(event) = tracker.key(&chord, stale, false) {
                             on_event(event);
                         }
@@ -144,20 +142,28 @@ impl HotkeyManager {
                 } else {
                     keys.remove(&key);
                 }
-                let chord = tracker_chord.lock().unwrap().clone();
-                let event = tracker.key(&chord, key, down);
-                tracker_held.store(tracker.pressed.len(), Ordering::Relaxed);
+                let event = {
+                    let chord = tracker_chord.lock().unwrap();
+                    tracker.key(&chord, key, down)
+                };
                 if let Some(event) = event {
                     on_event(event);
                 }
             }
         });
-        Ok(Self { chord, held })
+        Ok(Self { chord })
     }
 
     /// True while any physical key is down (typing then would combine with held modifiers).
+    /// Reads the kernel's live key bitmaps (EVIOCGKEY), so a key held since before startup
+    /// counts and a missed release cannot wedge the check.
     pub fn keys_held(&self) -> bool {
-        self.held.load(Ordering::Relaxed) > 0
+        keyboards().into_iter().any(|path| {
+            Device::open(path).is_ok_and(|d| {
+                d.get_key_state()
+                    .is_ok_and(|state| state.iter().next().is_some())
+            })
+        })
     }
 
     pub fn set_shortcut(&self, shortcut: &str) -> Result<()> {
@@ -166,7 +172,7 @@ impl HotkeyManager {
     }
 }
 
-fn keyboards() -> Vec<PathBuf> {
+fn event_nodes() -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
         return Vec::new();
     };
@@ -177,43 +183,71 @@ fn keyboards() -> Vec<PathBuf> {
             p.file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with("event"))
         })
-        .filter(|p| {
-            Device::open(p).is_ok_and(|d| {
-                d.supported_keys().is_some_and(|k| {
-                    k.contains(KeyCode::KEY_LEFTCTRL) && k.contains(KeyCode::KEY_A)
-                })
-            })
-        })
         .collect()
 }
 
-/// Opens new keyboards as they appear (hotplug); polling every few seconds keeps idle CPU negligible.
+/// Only real keyboards are watched, so mice and touchpads get no reader thread
+/// (their BTN_* clicks would otherwise cancel a held chord).
+fn is_keyboard(device: &Device) -> bool {
+    device
+        .supported_keys()
+        .is_some_and(|k| k.contains(KeyCode::KEY_LEFTCTRL) && k.contains(KeyCode::KEY_A))
+}
+
+fn keyboards() -> Vec<PathBuf> {
+    event_nodes()
+        .into_iter()
+        .filter(|p| Device::open(p).is_ok_and(|d| is_keyboard(&d)))
+        .collect()
+}
+
+/// Opens new keyboards as they appear (hotplug). Each pass costs a directory
+/// listing; a device node is probed only when it is new or was reused after an
+/// unplug, so idle CPU stays negligible.
 fn watch_devices(sender: Sender<(String, KeyCode, bool)>) {
     let open: Arc<Mutex<HashSet<PathBuf>>> = Default::default();
+    // Nodes probed and known not to be keyboards (mice, touchpads).
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     loop {
-        for path in keyboards() {
-            if !open.lock().unwrap().insert(path.clone()) {
+        let nodes: HashSet<PathBuf> = event_nodes().into_iter().collect();
+        // Drop vanished nodes so a node number reused by another device is
+        // evaluated again. Readers also remove their path on exit.
+        seen.retain(|p| nodes.contains(p));
+        open.lock().unwrap().retain(|p| nodes.contains(p));
+        for path in nodes {
+            if seen.contains(&path) || open.lock().unwrap().contains(&path) {
                 continue;
             }
-            let (sender, open) = (sender.clone(), open.clone());
-            std::thread::spawn(move || {
-                let id = path.to_string_lossy().to_string();
-                if let Ok(mut device) = Device::open(&path) {
-                    log::info!("hotkey: watching {}", device.name().unwrap_or("keyboard"));
-                    'read: while let Ok(events) = device.fetch_events() {
-                        for event in events {
-                            // value 2 is autorepeat; ignore it.
-                            if let EventSummary::Key(_, key, value @ 0..=1) = event.destructure() {
-                                if sender.send((id.clone(), key, value == 1)).is_err() {
-                                    break 'read;
+            match Device::open(&path) {
+                // Unreadable for now (udev ACL not applied yet, node going away):
+                // retry next pass.
+                Err(_) => {}
+                Ok(device) if !is_keyboard(&device) => {
+                    seen.insert(path);
+                }
+                Ok(mut device) => {
+                    open.lock().unwrap().insert(path.clone());
+                    let (sender, open) = (sender.clone(), open.clone());
+                    std::thread::spawn(move || {
+                        let id = path.to_string_lossy().to_string();
+                        log::info!("hotkey: watching {}", device.name().unwrap_or("keyboard"));
+                        'read: while let Ok(events) = device.fetch_events() {
+                            for event in events {
+                                // value 2 is autorepeat; ignore it.
+                                if let EventSummary::Key(_, key, value @ 0..=1) =
+                                    event.destructure()
+                                {
+                                    if sender.send((id.clone(), key, value == 1)).is_err() {
+                                        break 'read;
+                                    }
                                 }
                             }
                         }
-                    }
+                        let _ = sender.send((id, KeyCode::KEY_RESERVED, false));
+                        open.lock().unwrap().remove(&path);
+                    });
                 }
-                let _ = sender.send((id, KeyCode::KEY_RESERVED, false));
-                open.lock().unwrap().remove(&path);
-            });
+            }
         }
         std::thread::sleep(Duration::from_secs(3));
     }

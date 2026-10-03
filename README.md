@@ -1,6 +1,6 @@
 # Voice Prompt
 
-Push-to-talk dictation for AI coding-agent prompts on Pop!_OS / COSMIC (Wayland).
+Push-to-talk dictation for AI coding-agent prompts on Pop!\_OS / COSMIC (Wayland).
 Hold **Ctrl+Super**, speak, release: the transcript is cleaned up and typed into the focused app.
 
 Stack: Rust + Tauri 2 (backend, `src-tauri/`), React + TypeScript (settings UI and overlay, `src/`).
@@ -15,11 +15,11 @@ pnpm tauri build
 sudo apt install ./src-tauri/target/release/bundle/deb/voice-prompt_0.1.0_amd64.deb
 ```
 
-The package adds the installing user to the `input` group (needed for push-to-talk). Log out and back in once.
+The package installs a udev rule granting the active session read access to `/dev/input` (needed for push-to-talk), effective immediately; the `input` group is added as a fallback.
 
 ## First run
 
-Open *Voice Prompt* from the launcher, then **Speech → API key** (stored in the Secret Service keyring) and **Test connection**.
+Open _Voice Prompt_ from the launcher, then **Speech → API key** (stored in the Secret Service keyring) and **Test connection**.
 
 ## Development checks
 
