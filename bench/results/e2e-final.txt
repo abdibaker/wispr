@@ -1,0 +1,4 @@
+1791268889 INFO latency total=4425 audio=10200 chars=86 idle=19272 capture=33 first_audio=76 finish=50 keyring=70 wav=12 stt_setup=0 stt_wait=2502 stt_read=0 stt_norm=0 cleanup_setup=0 cleanup_wait=1608 cleanup_read=0 cleanup_norm=0 history=10 held_wait=14 insert_setup=1 insert_keys=151 clipboard=0 untimed=7
+1791268918 INFO latency total=3286 audio=10750 chars=100 idle=25991 capture=35 first_audio=79 finish=37 keyring=122 wav=15 stt_setup=0 stt_wait=1500 stt_read=1 stt_norm=0 cleanup_setup=0 cleanup_wait=1421 cleanup_read=0 cleanup_norm=0 history=9 held_wait=7 insert_setup=0 insert_keys=165 clipboard=1 untimed=8
+--- received text:
+Let's go to the Chinese restaurant tonight, but do not bring Sam; he is very annoying.Limit the cache to 512MB. Retry at most 3 times with a 250ms backoff, and time out after 15 seconds.

@@ -1,0 +1,7 @@
+1791264329 INFO latency total=5410 audio=10750 chars=102 idle=19790 capture=38 first_audio=82 finish=39 keyring=72 wav=12 stt_setup=0 stt_wait=2969 stt_read=0 stt_norm=0 cleanup_setup=0 cleanup_wait=2099 cleanup_read=0 cleanup_norm=0 history=18 held_wait=16 insert_setup=2 insert_keys=174 clipboard=1 untimed=8
+1791264446 INFO latency total=4200 audio=10750 chars=100 idle=113008 capture=30 first_audio=74 finish=31 keyring=96 wav=13 stt_setup=0 stt_wait=2178 stt_read=0 stt_norm=0 cleanup_setup=0 cleanup_wait=1662 cleanup_read=0 cleanup_norm=0 history=14 held_wait=21 insert_setup=1 insert_keys=178 clipboard=0 untimed=6
+1791268325 INFO latency total=5958 audio=10750 chars=96 idle=114209 capture=30 first_audio=74 finish=31 keyring=79 wav=12 stt_setup=0 stt_wait=3401 stt_read=0 stt_norm=0 cleanup_setup=0 cleanup_wait=2240 cleanup_read=0 cleanup_norm=0 history=10 held_wait=8 insert_setup=4 insert_keys=166 clipboard=0 untimed=7
+1791268448 INFO latency total=10639 audio=10750 chars=100 idle=112452 capture=31 first_audio=75 finish=32 keyring=107 wav=14 stt_setup=0 stt_wait=7898 stt_read=242 stt_norm=0 cleanup_setup=0 cleanup_wait=2084 cleanup_read=59 cleanup_norm=0 history=11 held_wait=15 insert_setup=1 insert_keys=166 clipboard=1 untimed=9
+--- received text:
+Limit the cache to 512 MB. Retry at most 3 times with a 250 ms backoff, and time out after 15 seconds.Limit the cache to 512MB, retry at most 3 times with a 250ms backoff, and time out after 15 seconds.clear
+

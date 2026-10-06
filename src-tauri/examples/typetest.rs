@@ -7,5 +7,6 @@ fn main() -> anyhow::Result<()> {
     insertion::insert(
         insertion::Method::Type,
         "Héllo, `src/main.rs` — ünïcode ✓ 9Router\nline two\n",
-    )
+    )?;
+    Ok(())
 }

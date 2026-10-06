@@ -1,4 +1,4 @@
-//! Manual end-to-end check: `VP_KEY=... cargo run --example pipeline -- audio.wav [--type]`
+//! Manual end-to-end check: `VP_KEY=... [VP_CLEANUP_MODEL=...] cargo run --example pipeline -- audio.wav [--type]`
 #[path = "../src/insertion.rs"]
 #[allow(dead_code)]
 mod insertion;
@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         transcript.text
     );
     let cleaner = OpenAiCompatible {
-        model: defaults.cleanup_model.clone(),
+        model: std::env::var("VP_CLEANUP_MODEL").unwrap_or(defaults.cleanup_model.clone()),
         reasoning_effort: "low".into(),
         timeout: Duration::from_secs(15),
         ..provider
@@ -44,10 +44,10 @@ async fn main() -> anyhow::Result<()> {
     let cleaned = cleaner
         .clean(&transcript.text, &defaults.vocabulary, "")
         .await?;
-    println!("Cleanup {} ms: {}", started.elapsed().as_millis(), cleaned);
+    println!("Cleanup {} ms: {}", started.elapsed().as_millis(), cleaned.text);
     if args.iter().any(|a| a == "--type") {
         std::thread::sleep(Duration::from_secs(2));
-        insertion::insert(insertion::Method::Type, &cleaned)?;
+        insertion::insert(insertion::Method::Type, &cleaned.text)?;
     }
     Ok(())
 }

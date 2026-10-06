@@ -14,20 +14,118 @@ use providers::{OpenAiCompatible, PromptCleaner, SpeechProvider};
 use serde::Serialize;
 use settings::Settings;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-#[derive(Serialize, Clone, Default)]
+/// Per-dictation stage timings, logged as one `latency` line (`bench/run.py latency` summarizes them).
+#[derive(Serialize, Clone, Default, Debug)]
 struct Latency {
-    hotkey_to_recording_ms: u64,
-    release_to_stt_ms: u64,
-    stt_to_cleanup_ms: u64,
-    cleanup_to_insert_ms: u64,
-    release_to_prompt_ms: u64,
+    hotkey_to_capture_ms: u64,
+    capture_to_first_audio_ms: u64,
+    finish_ms: u64,
+    keyring_ms: u64,
+    wav_ms: u64,
+    stt_setup_ms: u64,
+    stt_wait_ms: u64,
+    stt_read_ms: u64,
+    stt_normalize_ms: u64,
+    cleanup_setup_ms: u64,
+    cleanup_wait_ms: u64,
+    cleanup_read_ms: u64,
+    cleanup_normalize_ms: u64,
+    history_ms: u64,
+    held_wait_ms: u64,
+    insert_setup_ms: u64,
+    insert_keys_ms: u64,
+    clipboard_ms: u64,
+    /// Release → text delivered; the sum of the stages above plus untimed glue.
+    release_to_delivered_ms: u64,
     audio_ms: u64,
+    /// Time since the previous provider request; above the 90 s pool timeout the
+    /// connection is cold.
+    idle_ms: u64,
+}
+
+impl Latency {
+    fn log(&self, chars: usize) {
+        let timed = self.finish_ms
+            + self.keyring_ms
+            + self.wav_ms
+            + self.stt_setup_ms
+            + self.stt_wait_ms
+            + self.stt_read_ms
+            + self.stt_normalize_ms
+            + self.cleanup_setup_ms
+            + self.cleanup_wait_ms
+            + self.cleanup_read_ms
+            + self.cleanup_normalize_ms
+            + self.history_ms
+            + self.held_wait_ms
+            + self.insert_setup_ms
+            + self.insert_keys_ms
+            + self.clipboard_ms;
+        log::info!(
+            "latency total={} audio={} chars={} idle={} capture={} first_audio={} finish={} keyring={} wav={} \
+             stt_setup={} stt_wait={} stt_read={} stt_norm={} cleanup_setup={} cleanup_wait={} cleanup_read={} \
+             cleanup_norm={} history={} held_wait={} insert_setup={} insert_keys={} clipboard={} untimed={}",
+            self.release_to_delivered_ms,
+            self.audio_ms,
+            chars,
+            self.idle_ms,
+            self.hotkey_to_capture_ms,
+            self.capture_to_first_audio_ms,
+            self.finish_ms,
+            self.keyring_ms,
+            self.wav_ms,
+            self.stt_setup_ms,
+            self.stt_wait_ms,
+            self.stt_read_ms,
+            self.stt_normalize_ms,
+            self.cleanup_setup_ms,
+            self.cleanup_wait_ms,
+            self.cleanup_read_ms,
+            self.cleanup_normalize_ms,
+            self.history_ms,
+            self.held_wait_ms,
+            self.insert_setup_ms,
+            self.insert_keys_ms,
+            self.clipboard_ms,
+            self.release_to_delivered_ms.saturating_sub(timed),
+        );
+    }
+}
+
+fn ms(since: Instant) -> u64 {
+    since.elapsed().as_millis() as u64
+}
+
+/// Exclusive ownership of the pipeline; released on drop, including early returns.
+struct Busy(Arc<AtomicBool>);
+
+impl Busy {
+    fn acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self(flag.clone()))
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+struct Session {
+    /// Owned from key press to the end of processing, so a retry cannot run alongside.
+    busy: Busy,
+    recording: audio::Recording,
+    pressed: Instant,
+    capture_started: Instant,
+    latency: Latency,
 }
 
 struct AppState {
@@ -35,11 +133,16 @@ struct AppState {
     history: Mutex<HistoryStore>,
     hotkey: Mutex<Option<HotkeyManager>>,
     hotkey_error: Mutex<Option<String>>,
-    recording: Mutex<Option<(audio::Recording, Instant)>>,
+    recording: Mutex<Option<Session>>,
     /// Kept in memory only, so a failed STT call can be retried without re-speaking.
     failed_audio: Mutex<Option<Vec<i16>>>,
-    busy: AtomicBool,
+    /// The last finished prompt, so text whose insertion failed can still be recovered
+    /// (tray → Copy last prompt) even with history disabled.
+    last_prompt: Mutex<Option<String>>,
+    busy: Arc<AtomicBool>,
     latency: Mutex<Option<Latency>>,
+    started: Instant,
+    last_request: Mutex<Option<Instant>>,
     client: reqwest::Client,
 }
 
@@ -112,11 +215,12 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
     let state = app.state::<AppState>();
     match event {
         HotkeyEvent::Pressed => {
-            if state.busy.load(Ordering::SeqCst) {
+            let Some(busy) = Busy::acquire(&state.busy) else {
                 return;
-            }
+            };
             let pressed = Instant::now();
             let settings = state.settings.lock().unwrap().clone();
+            let capture_started = Instant::now();
             let level_app = app.clone();
             match audio::Recording::start(
                 &settings.microphone,
@@ -134,12 +238,17 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
                 },
             ) {
                 Ok(recording) => {
-                    log::debug!("hotkey→recording {} ms", pressed.elapsed().as_millis());
-                    *state.latency.lock().unwrap() = Some(Latency {
-                        hotkey_to_recording_ms: pressed.elapsed().as_millis() as u64,
+                    let latency = Latency {
+                        hotkey_to_capture_ms: ms(pressed),
                         ..Default::default()
+                    };
+                    *state.recording.lock().unwrap() = Some(Session {
+                        busy,
+                        recording,
+                        pressed,
+                        capture_started,
+                        latency,
                     });
-                    *state.recording.lock().unwrap() = Some((recording, pressed));
                     if settings.sounds {
                         audio::beep(880.0, 60);
                     }
@@ -154,29 +263,35 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
             }
         }
         HotkeyEvent::Cancelled => {
-            if let Some((recording, _)) = state.recording.lock().unwrap().take() {
-                drop(recording.finish());
+            if let Some(session) = state.recording.lock().unwrap().take() {
+                drop(session.recording.finish());
                 overlay(app, "hidden", "");
             }
         }
         HotkeyEvent::Released => {
-            let Some((recording, pressed)) = state.recording.lock().unwrap().take() else {
+            let Some(session) = state.recording.lock().unwrap().take() else {
                 return;
             };
             let released = Instant::now();
-            let samples = recording.finish();
+            let mut latency = session.latency;
+            let first_audio = session.recording.first_sample.get().copied();
+            let samples = session.recording.finish();
+            latency.finish_ms = ms(released);
+            latency.capture_to_first_audio_ms = first_audio.map_or(0, |first| {
+                first.saturating_duration_since(session.capture_started).as_millis() as u64
+            });
             if state.settings.lock().unwrap().sounds {
                 audio::beep(660.0, 60);
             }
+            let busy = session.busy;
+            let held = released - session.pressed;
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let state = app.state::<AppState>();
-                state.busy.store(true, Ordering::SeqCst);
                 let result = match samples {
-                    Ok(samples) => process(&app, samples, pressed, released).await,
+                    Ok(samples) => process(&app, samples, latency, released, held).await,
                     Err(error) => Err(error),
                 };
-                state.busy.store(false, Ordering::SeqCst);
+                drop(busy);
                 if let Err(error) = result {
                     log::warn!("dictation failed: {error:#}");
                     overlay(&app, "error", format!("{error}"));
@@ -192,20 +307,24 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
 async fn process(
     app: &AppHandle,
     samples: Vec<i16>,
-    pressed: Instant,
+    mut latency: Latency,
     released: Instant,
+    held: Duration,
 ) -> Result<()> {
     let state = app.state::<AppState>();
     let settings = state.settings.lock().unwrap().clone();
     let audio_ms = samples.len() as u64 * 1000 / audio::RATE as u64;
-    if (released - pressed).as_millis() < settings.min_hold_ms as u128 || audio::is_silent(&samples)
-    {
+    latency.audio_ms = audio_ms;
+    if held.as_millis() < settings.min_hold_ms as u128 || audio::is_silent(&samples) {
         overlay(app, "hidden", "");
         return Ok(());
     }
+    let started = Instant::now();
     let api_key = settings::secret::get()?
         .ok_or_else(|| anyhow!("No 9Router API key. Open Voice Prompt settings → Speech."))?;
+    latency.keyring_ms = ms(started);
     overlay(app, "transcribing", "");
+    latency.idle_ms = ms(state.last_request.lock().unwrap().unwrap_or(state.started));
     let stt = OpenAiCompatible {
         client: state.client.clone(),
         base_url: settings.endpoint.clone(),
@@ -214,7 +333,9 @@ async fn process(
         timeout: Duration::from_secs(settings.stt_timeout_secs),
         reasoning_effort: String::new(),
     };
+    let encoding = Instant::now();
     let wav = providers::wav(&samples, audio::RATE);
+    latency.wav_ms = ms(encoding);
     let transcript = match stt
         .transcribe(
             wav,
@@ -225,6 +346,10 @@ async fn process(
     {
         Ok(transcript) => {
             *state.failed_audio.lock().unwrap() = None;
+            latency.stt_setup_ms = transcript.timing.setup_ms;
+            latency.stt_wait_ms = transcript.timing.wait_ms;
+            latency.stt_read_ms = transcript.timing.body_ms;
+            latency.stt_normalize_ms = transcript.timing.normalize_ms;
             transcript
         }
         Err(error) => {
@@ -233,7 +358,7 @@ async fn process(
         }
     };
     drop(samples);
-    let stt_done = Instant::now();
+    *state.last_request.lock().unwrap() = Some(Instant::now());
     if transcript.text.is_empty() {
         overlay(app, "error", "Nothing recognised");
         hide_overlay_later(app, 1500);
@@ -258,18 +383,26 @@ async fn process(
             )
             .await
         {
-            Ok(text) => cleaned = Some(text),
+            Ok(result) => {
+                latency.cleanup_setup_ms = result.timing.setup_ms;
+                latency.cleanup_wait_ms = result.timing.wait_ms;
+                latency.cleanup_read_ms = result.timing.body_ms;
+                latency.cleanup_normalize_ms = result.timing.normalize_ms;
+                cleaned = Some(result.text);
+            }
             Err(error) => {
                 log::warn!("cleanup failed, using raw transcript: {error:#}");
                 cleanup_error = Some(format!("{error}"));
             }
         }
     }
-    let cleanup_done = Instant::now();
+    *state.last_request.lock().unwrap() = Some(Instant::now());
     let prompt = cleaned.clone().unwrap_or_else(|| transcript.text.clone());
+    *state.last_prompt.lock().unwrap() = Some(prompt.clone());
 
-    // Save first: insertion problems must never lose the prompt.
-    let mut entry = Entry {
+    // Save first: insertion problems (or a hung compositor) must never lose the prompt.
+    let saving = Instant::now();
+    let entry = Entry {
         id: 0,
         created_at: now_ms(),
         raw: transcript.text.clone(),
@@ -286,43 +419,30 @@ async fn process(
             .then(|| settings.cleanup_model.clone()),
         error: cleanup_error.clone(),
         duration_ms: audio_ms as i64,
-        latency_ms: 0,
+        latency_ms: released.elapsed().as_millis() as i64,
     };
-
-    let delivered = deliver(app, &settings, &prompt).await;
-    let inserted = Instant::now();
-    let latency = Latency {
-        hotkey_to_recording_ms: state
-            .latency
+    let saved = if settings.history_enabled {
+        state
+            .history
             .lock()
             .unwrap()
-            .as_ref()
-            .map_or(0, |l| l.hotkey_to_recording_ms),
-        release_to_stt_ms: (stt_done - released).as_millis() as u64,
-        stt_to_cleanup_ms: (cleanup_done - stt_done).as_millis() as u64,
-        cleanup_to_insert_ms: (inserted - cleanup_done).as_millis() as u64,
-        release_to_prompt_ms: (inserted - released).as_millis() as u64,
-        audio_ms,
+            .add(&entry)
+            .map_err(|error| log::warn!("history write failed: {error:#}"))
+            .ok()
+    } else {
+        None
     };
-    log::info!(
-        "latency: hotkey→rec {}ms, release→stt {}ms, stt→cleanup {}ms, cleanup→insert {}ms, total {}ms (audio {}ms, {} chars)",
-        latency.hotkey_to_recording_ms,
-        latency.release_to_stt_ms,
-        latency.stt_to_cleanup_ms,
-        latency.cleanup_to_insert_ms,
-        latency.release_to_prompt_ms,
-        audio_ms,
-        prompt.chars().count()
-    );
-    entry.latency_ms = latency.release_to_prompt_ms as i64;
-    *state.latency.lock().unwrap() = Some(latency);
-    if settings.history_enabled {
+    latency.history_ms = ms(saving);
+
+    let delivered = deliver(app, &settings, &prompt, &mut latency).await;
+    latency.release_to_delivered_ms = ms(released);
+    latency.log(prompt.chars().count());
+    if let Some(id) = saved {
         let history = state.history.lock().unwrap();
-        if let Err(error) = history.add(&entry) {
-            log::warn!("history write failed: {error:#}");
-        }
+        let _ = history.set_latency(id, latency.release_to_delivered_ms as i64);
         let _ = history.prune(settings.history_retention_days, now_ms());
     }
+    *state.latency.lock().unwrap() = Some(latency);
     let _ = app.emit("history-changed", ());
 
     match (delivered, cleanup_error) {
@@ -333,8 +453,9 @@ async fn process(
             format!("Cleanup failed, raw text {}", how.to_lowercase()),
         ),
         (Err(error), _) => {
-            overlay(app, "error", format!("{error}"));
-            notify(app, &format!("{error}"));
+            let message = format!("{error} (tray → Copy last prompt)");
+            overlay(app, "error", &message);
+            notify(app, &message);
         }
     }
     hide_overlay_later(app, 1600);
@@ -342,43 +463,72 @@ async fn process(
 }
 
 /// Inserts into the focused app, falling back to the clipboard. Returns what happened.
-async fn deliver(app: &AppHandle, settings: &Settings, text: &str) -> Result<String> {
+async fn deliver(
+    app: &AppHandle,
+    settings: &Settings,
+    text: &str,
+    latency: &mut Latency,
+) -> Result<String> {
+    let copy = |latency: &mut Latency| -> Result<()> {
+        let started = Instant::now();
+        let result = insertion::copy_to_clipboard(text);
+        latency.clipboard_ms += ms(started);
+        result
+    };
     let method = insertion::Method::parse(&settings.insertion_method);
     if !settings.auto_insert || method == insertion::Method::Clipboard {
-        insertion::copy_to_clipboard(text)?;
+        copy(latency)?;
         return Ok("Copied — press Ctrl+V".into());
     }
     // Typing while the user still holds a modifier would turn letters into shortcuts.
-    let state = app.state::<AppState>();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        let held = state
-            .hotkey
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|h| h.keys_held());
-        if !held {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let waiting = Instant::now();
+    let held = wait_for_keys_released(app, Duration::from_secs(3)).await;
+    latency.held_wait_ms = ms(waiting);
+    if held {
+        log::warn!("keys still held after 3 s; copying instead of typing");
+        copy(latency)?;
+        return Ok("Keys still held — copied, press Ctrl+V".into());
     }
     let text_owned = text.to_string();
     let result =
         tauri::async_runtime::spawn_blocking(move || insertion::insert(method, &text_owned))
             .await?;
     match result {
-        Ok(()) => {
+        Ok(timing) => {
+            latency.insert_setup_ms = timing.setup_ms;
+            latency.insert_keys_ms = timing.keys_ms;
+            latency.clipboard_ms = timing.clipboard_ms;
             if settings.keep_in_clipboard && method == insertion::Method::Type {
-                insertion::copy_to_clipboard(text)?;
+                // The text is already inserted; a clipboard failure here is not a delivery failure.
+                if let Err(error) = copy(latency) {
+                    log::warn!("keep-in-clipboard failed: {error:#}");
+                }
             }
             Ok("Inserted".into())
         }
         Err(error) => {
             log::warn!("insertion failed, copying instead: {error:#}");
-            insertion::copy_to_clipboard(text)?;
+            copy(latency)?;
             Ok("Copied — press Ctrl+V".into())
         }
+    }
+}
+
+/// Polls physical key state for up to `limit`; returns true if keys are still held.
+async fn wait_for_keys_released(app: &AppHandle, limit: Duration) -> bool {
+    let state = app.state::<AppState>();
+    let deadline = Instant::now() + limit;
+    loop {
+        let held = state
+            .hotkey
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| h.keys_held());
+        if !held || Instant::now() >= deadline {
+            return held;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -562,23 +712,40 @@ async fn diagnostics(state: tauri::State<'_, AppState>) -> CommandResult<Diagnos
 
 fn retry_last(app: &AppHandle) {
     let state = app.state::<AppState>();
+    let Some(busy) = Busy::acquire(&state.busy) else {
+        notify(app, "A dictation is still being processed.");
+        return;
+    };
     let Some(samples) = state.failed_audio.lock().unwrap().take() else {
         notify(app, "Nothing to retry.");
         return;
     };
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
-        state.busy.store(true, Ordering::SeqCst);
-        let now = Instant::now();
-        let result = process(&app, samples, now - Duration::from_secs(1), now).await;
-        state.busy.store(false, Ordering::SeqCst);
+        let result = process(
+            &app,
+            samples,
+            Latency::default(),
+            Instant::now(),
+            Duration::MAX,
+        )
+        .await;
+        drop(busy);
         if let Err(error) = result {
             overlay(&app, "error", format!("{error}"));
             notify(&app, &format!("{error}"));
             hide_overlay_later(&app, 4000);
         }
     });
+}
+
+fn copy_last_prompt(app: &AppHandle) {
+    let prompt = app.state::<AppState>().last_prompt.lock().unwrap().clone();
+    match prompt.map(|text| insertion::copy_to_clipboard(&text)) {
+        None => notify(app, "No prompt yet."),
+        Some(Ok(())) => notify(app, "Last prompt copied — press Ctrl+V."),
+        Some(Err(error)) => notify(app, &format!("{error}")),
+    }
 }
 
 fn show_settings(app: &AppHandle) {
@@ -636,7 +803,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let open = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let retry = MenuItem::with_id(app, "retry", "Retry last recording", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &retry, &quit])?;
+    let copy_last = MenuItem::with_id(app, "copy-last", "Copy last prompt", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &retry, &copy_last, &quit])?;
     TrayIconBuilder::with_id("tray")
         .icon(app.default_window_icon().cloned().ok_or("missing icon")?)
         .tooltip("Voice Prompt")
@@ -645,6 +813,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "quit" => app.exit(0),
             "settings" => show_settings(app),
             "retry" => retry_last(app),
+            "copy-last" => copy_last_prompt(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -697,8 +866,11 @@ fn main() {
         hotkey_error: Mutex::new(None),
         recording: Mutex::new(None),
         failed_audio: Mutex::new(None),
-        busy: AtomicBool::new(false),
+        last_prompt: Mutex::new(None),
+        busy: Arc::new(AtomicBool::new(false)),
         latency: Mutex::new(None),
+        started: Instant::now(),
+        last_request: Mutex::new(None),
         client: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
@@ -735,4 +907,33 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_is_exclusive_and_released_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = Busy::acquire(&flag).expect("free pipeline");
+        assert!(Busy::acquire(&flag).is_none(), "second session must not start");
+        drop(first);
+        assert!(Busy::acquire(&flag).is_some());
+    }
+
+    #[test]
+    fn busy_race_has_one_winner() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let winners: usize = (0..8)
+            .map(|_| {
+                let flag = flag.clone();
+                std::thread::spawn(move || Busy::acquire(&flag).map(std::mem::forget).is_some())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap() as usize)
+            .sum();
+        assert_eq!(winners, 1);
+    }
 }

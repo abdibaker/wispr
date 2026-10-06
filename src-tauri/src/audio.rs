@@ -11,8 +11,9 @@ use serde::Serialize;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 pub const RATE: u32 = 16_000;
 
@@ -27,6 +28,8 @@ fn spec() -> Spec {
 pub struct Recording {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<Result<Vec<i16>>>,
+    /// When the first chunk of audio arrived (capture latency instrumentation).
+    pub first_sample: Arc<OnceLock<Instant>>,
 }
 
 impl Recording {
@@ -59,6 +62,8 @@ impl Recording {
         .map_err(|e| anyhow!("Microphone unavailable: {e}"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
+        let first_sample = Arc::new(OnceLock::new());
+        let first = first_sample.clone();
         let handle = std::thread::spawn(move || {
             let mut samples: Vec<i16> = Vec::with_capacity(RATE as usize * 10);
             let mut chunk = vec![0u8; chunk_bytes as usize];
@@ -67,6 +72,7 @@ impl Recording {
                 simple
                     .read(&mut chunk)
                     .map_err(|e| anyhow!("Microphone read failed: {e}"))?;
+                first.get_or_init(Instant::now);
                 let start = samples.len();
                 samples.extend(
                     chunk
@@ -79,7 +85,11 @@ impl Recording {
             }
             Ok(samples)
         });
-        Ok(Self { stop, handle })
+        Ok(Self {
+            stop,
+            handle,
+            first_sample,
+        })
     }
 
     pub fn finish(self) -> Result<Vec<i16>> {

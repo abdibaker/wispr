@@ -63,9 +63,10 @@ impl Chord {
     }
 }
 
-/// Tracks chord state from a stream of key events.
+/// Tracks chord state from key events of several keyboards. A key counts as down while any
+/// keyboard holds it, so releasing Ctrl on one keyboard keeps a Ctrl held on another.
 pub struct Tracker {
-    pressed: HashSet<KeyCode>,
+    per_device: HashMap<String, HashSet<KeyCode>>,
     active: bool,
     cancelled: bool,
 }
@@ -73,20 +74,43 @@ pub struct Tracker {
 impl Tracker {
     pub fn new() -> Self {
         Self {
-            pressed: HashSet::new(),
+            per_device: HashMap::new(),
             active: false,
             cancelled: false,
         }
     }
 
-    pub fn key(&mut self, chord: &Chord, key: KeyCode, down: bool) -> Option<HotkeyEvent> {
+    /// Releases every key of a device that went away.
+    pub fn unplug(&mut self, chord: &Chord, device: &str) -> Vec<HotkeyEvent> {
+        let stale: Vec<KeyCode> = self
+            .per_device
+            .get(device)
+            .map(|keys| keys.iter().copied().collect())
+            .unwrap_or_default();
+        let events = stale
+            .into_iter()
+            .filter_map(|key| self.key(chord, device, key, false))
+            .collect();
+        self.per_device.remove(device);
+        events
+    }
+
+    pub fn key(
+        &mut self,
+        chord: &Chord,
+        device: &str,
+        key: KeyCode,
+        down: bool,
+    ) -> Option<HotkeyEvent> {
+        let keys = self.per_device.entry(device.to_string()).or_default();
         if down {
-            self.pressed.insert(key);
+            keys.insert(key);
         } else {
-            self.pressed.remove(&key);
+            keys.remove(&key);
         }
-        let held = chord.held(&self.pressed);
-        let extra = self.pressed.iter().any(|k| !chord.contains(*k));
+        let pressed: HashSet<KeyCode> = self.per_device.values().flatten().copied().collect();
+        let held = chord.held(&pressed);
+        let extra = pressed.iter().any(|k| !chord.contains(*k));
         if self.active {
             if extra && down {
                 self.active = false;
@@ -101,7 +125,7 @@ impl Tracker {
             self.active = true;
             return Some(HotkeyEvent::Pressed);
         }
-        if self.pressed.is_empty() {
+        if pressed.is_empty() {
             self.cancelled = false;
         }
         None
@@ -110,6 +134,9 @@ impl Tracker {
 
 pub struct HotkeyManager {
     chord: Arc<Mutex<Chord>>,
+    /// Keyboards the watcher has open; probing every /dev/input node instead costs ~0.9 s
+    /// because some sensors (e.g. an accelerometer) take 700 ms to open.
+    keyboards: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl HotkeyManager {
@@ -120,45 +147,35 @@ impl HotkeyManager {
         if keyboards().is_empty() {
             bail!("No readable keyboard in /dev/input. Re-login, or add your user to the 'input' group and log in again.");
         }
-        std::thread::spawn(move || watch_devices(sender));
+        let keyboards: Arc<Mutex<HashSet<PathBuf>>> = Default::default();
+        let watched = keyboards.clone();
+        std::thread::spawn(move || watch_devices(sender, watched));
         let tracker_chord = chord.clone();
         std::thread::spawn(move || {
             let mut tracker = Tracker::new();
-            // Per-device key state so a device unplugged mid-chord cannot leave keys stuck.
-            let mut per_device: HashMap<String, HashSet<KeyCode>> = HashMap::new();
             for (device, key, down) in receiver {
-                if key == KeyCode::KEY_RESERVED {
-                    for stale in per_device.remove(&device).unwrap_or_default() {
-                        let chord = tracker_chord.lock().unwrap();
-                        if let Some(event) = tracker.key(&chord, stale, false) {
-                            on_event(event);
-                        }
-                    }
-                    continue;
-                }
-                let keys = per_device.entry(device).or_default();
-                if down {
-                    keys.insert(key);
-                } else {
-                    keys.remove(&key);
-                }
-                let event = {
+                let events = {
                     let chord = tracker_chord.lock().unwrap();
-                    tracker.key(&chord, key, down)
+                    if key == KeyCode::KEY_RESERVED {
+                        tracker.unplug(&chord, &device)
+                    } else {
+                        tracker.key(&chord, &device, key, down).into_iter().collect()
+                    }
                 };
-                if let Some(event) = event {
+                for event in events {
                     on_event(event);
                 }
             }
         });
-        Ok(Self { chord })
+        Ok(Self { chord, keyboards })
     }
 
     /// True while any physical key is down (typing then would combine with held modifiers).
     /// Reads the kernel's live key bitmaps (EVIOCGKEY), so a key held since before startup
     /// counts and a missed release cannot wedge the check.
     pub fn keys_held(&self) -> bool {
-        keyboards().into_iter().any(|path| {
+        let paths: Vec<PathBuf> = self.keyboards.lock().unwrap().iter().cloned().collect();
+        paths.into_iter().any(|path| {
             Device::open(path).is_ok_and(|d| {
                 d.get_key_state()
                     .is_ok_and(|state| state.iter().next().is_some())
@@ -204,8 +221,7 @@ fn keyboards() -> Vec<PathBuf> {
 /// Opens new keyboards as they appear (hotplug). Each pass costs a directory
 /// listing; a device node is probed only when it is new or was reused after an
 /// unplug, so idle CPU stays negligible.
-fn watch_devices(sender: Sender<(String, KeyCode, bool)>) {
-    let open: Arc<Mutex<HashSet<PathBuf>>> = Default::default();
+fn watch_devices(sender: Sender<(String, KeyCode, bool)>, open: Arc<Mutex<HashSet<PathBuf>>>) {
     // Nodes probed and known not to be keyboards (mice, touchpads).
     let mut seen: HashSet<PathBuf> = HashSet::new();
     loop {
@@ -272,41 +288,64 @@ mod tests {
     fn press_and_release_in_any_order() {
         let chord = parse("Ctrl+Super").unwrap();
         let mut t = Tracker::new();
-        assert_eq!(t.key(&chord, K::KEY_LEFTCTRL, true), None);
-        assert_eq!(t.key(&chord, K::KEY_LEFTMETA, true), Some(Pressed));
-        assert_eq!(t.key(&chord, K::KEY_LEFTCTRL, false), Some(Released));
-        assert_eq!(t.key(&chord, K::KEY_LEFTMETA, false), None);
-        assert_eq!(t.key(&chord, K::KEY_RIGHTMETA, true), None);
-        assert_eq!(t.key(&chord, K::KEY_RIGHTCTRL, true), Some(Pressed));
-        assert_eq!(t.key(&chord, K::KEY_RIGHTMETA, false), Some(Released));
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFTCTRL, true), None);
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFTMETA, true), Some(Pressed));
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFTCTRL, false), Some(Released));
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFTMETA, false), None);
+        assert_eq!(t.key(&chord, "kb", K::KEY_RIGHTMETA, true), None);
+        assert_eq!(t.key(&chord, "kb", K::KEY_RIGHTCTRL, true), Some(Pressed));
+        assert_eq!(t.key(&chord, "kb", K::KEY_RIGHTMETA, false), Some(Released));
     }
 
     #[test]
     fn other_key_cancels_until_all_released() {
         let chord = parse("Ctrl+Super").unwrap();
         let mut t = Tracker::new();
-        t.key(&chord, K::KEY_LEFTCTRL, true);
-        assert_eq!(t.key(&chord, K::KEY_LEFTMETA, true), Some(Pressed));
-        assert_eq!(t.key(&chord, K::KEY_LEFT, true), Some(Cancelled));
-        assert_eq!(t.key(&chord, K::KEY_LEFT, false), None);
-        assert_eq!(t.key(&chord, K::KEY_LEFTMETA, false), None);
+        t.key(&chord, "kb", K::KEY_LEFTCTRL, true);
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFTMETA, true), Some(Pressed));
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFT, true), Some(Cancelled));
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFT, false), None);
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFTMETA, false), None);
         assert_eq!(
-            t.key(&chord, K::KEY_LEFTMETA, true),
+            t.key(&chord, "kb", K::KEY_LEFTMETA, true),
             None,
             "still cancelled while Ctrl held"
         );
-        t.key(&chord, K::KEY_LEFTMETA, false);
-        t.key(&chord, K::KEY_LEFTCTRL, false);
-        t.key(&chord, K::KEY_LEFTCTRL, true);
-        assert_eq!(t.key(&chord, K::KEY_LEFTMETA, true), Some(Pressed));
+        t.key(&chord, "kb", K::KEY_LEFTMETA, false);
+        t.key(&chord, "kb", K::KEY_LEFTCTRL, false);
+        t.key(&chord, "kb", K::KEY_LEFTCTRL, true);
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFTMETA, true), Some(Pressed));
     }
 
     #[test]
     fn chord_not_started_when_other_key_already_held() {
         let chord = parse("Ctrl+Super").unwrap();
         let mut t = Tracker::new();
-        t.key(&chord, K::KEY_C, true);
-        t.key(&chord, K::KEY_LEFTCTRL, true);
-        assert_eq!(t.key(&chord, K::KEY_LEFTMETA, true), None);
+        t.key(&chord, "kb", K::KEY_C, true);
+        t.key(&chord, "kb", K::KEY_LEFTCTRL, true);
+        assert_eq!(t.key(&chord, "kb", K::KEY_LEFTMETA, true), None);
+    }
+
+    #[test]
+    fn key_held_on_another_keyboard_keeps_chord_active() {
+        let chord = parse("Ctrl+Super").unwrap();
+        let mut t = Tracker::new();
+        t.key(&chord, "laptop", K::KEY_LEFTCTRL, true);
+        assert_eq!(t.key(&chord, "usb", K::KEY_LEFTMETA, true), Some(Pressed));
+        // Same key pressed on both keyboards, released on one: still held on the other.
+        t.key(&chord, "usb", K::KEY_LEFTCTRL, true);
+        assert_eq!(t.key(&chord, "laptop", K::KEY_LEFTCTRL, false), None);
+        assert_eq!(t.key(&chord, "usb", K::KEY_LEFTCTRL, false), Some(Released));
+    }
+
+    #[test]
+    fn unplug_releases_only_that_keyboard() {
+        let chord = parse("Ctrl+Super").unwrap();
+        let mut t = Tracker::new();
+        t.key(&chord, "laptop", K::KEY_LEFTCTRL, true);
+        assert_eq!(t.key(&chord, "usb", K::KEY_LEFTMETA, true), Some(Pressed));
+        assert_eq!(t.unplug(&chord, "usb"), vec![Released]);
+        assert!(t.unplug(&chord, "usb").is_empty());
+        assert_eq!(t.key(&chord, "laptop", K::KEY_LEFTMETA, true), Some(Pressed));
     }
 }

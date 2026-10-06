@@ -306,19 +306,29 @@ function Cleanup({ settings, update }: SectionProps) {
 
 function Vocabulary({ settings, update }: SectionProps) {
   const [term, setTerm] = useState("");
+  // Accepts one term or a pasted list (comma- or newline-separated).
   const add = () => {
-    const value = term.trim();
-    if (value && !settings.vocabulary.includes(value)) update({ vocabulary: [...settings.vocabulary, value] });
+    const known = new Set(settings.vocabulary.map((w) => w.toLowerCase()));
+    const added = term
+      .split(/[,\n]/)
+      .map((w) => w.trim())
+      .filter((w) => w && !known.has(w.toLowerCase()) && known.add(w.toLowerCase()));
+    if (added.length) update({ vocabulary: [...settings.vocabulary, ...added] });
     setTerm("");
   };
   return (
     <section>
       <h1>Vocabulary</h1>
-      <p className="lead">Terms passed to speech recognition as hints and used to correct spelling during cleanup.</p>
+      <p className="lead">
+        Terms passed to speech recognition as hints and used to correct spelling during cleanup. Add the names you
+        dictate often: projects, repositories, files, packages, commands, models and identifiers. Paste a comma- or
+        newline-separated list to add several. Speech recognition sees only the first ~400 characters, so put the most
+        important terms first; cleanup sees them all.
+      </p>
       <div className="inline">
         <input
           value={term}
-          placeholder="Add a term"
+          placeholder="Add terms, e.g. Cargo.toml, pnpm check, whisper-large-v3"
           aria-label="New vocabulary term"
           onChange={(e) => setTerm(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && add()}

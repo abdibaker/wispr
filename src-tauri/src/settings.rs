@@ -194,14 +194,34 @@ pub mod secret {
     }
 }
 
-/// Vocabulary terms joined as an STT prompt hint (Whisper reads the prompt as prior context).
-pub fn vocabulary_hint(vocabulary: &[String]) -> Option<String> {
-    let terms: Vec<&str> = vocabulary
+/// Character budget for the STT hint. Whisper keeps only the last 224 prompt tokens, and
+/// identifiers tokenize at roughly 2 characters per token, so overflow would silently drop
+/// the first (highest-priority) terms.
+pub const STT_HINT_CHARS: usize = 400;
+
+/// Trimmed, case-insensitively deduplicated terms in list order.
+pub fn vocabulary_terms(vocabulary: &[String]) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    vocabulary
         .iter()
         .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
-    (!terms.is_empty()).then(|| terms.join(", "))
+        .filter(|t| !t.is_empty() && seen.insert(t.to_lowercase()))
+        .collect()
+}
+
+/// Vocabulary terms joined as an STT prompt hint (Whisper reads the prompt as prior context),
+/// up to `STT_HINT_CHARS`. Cleanup receives the full list via `vocabulary_terms`.
+pub fn vocabulary_hint(vocabulary: &[String]) -> Option<String> {
+    let mut hint = String::new();
+    for term in vocabulary_terms(vocabulary) {
+        let separator = if hint.is_empty() { "" } else { ", " };
+        if hint.chars().count() + separator.len() + term.chars().count() > STT_HINT_CHARS {
+            break;
+        }
+        hint.push_str(separator);
+        hint.push_str(term);
+    }
+    (!hint.is_empty()).then_some(hint)
 }
 
 #[cfg(test)]
@@ -238,5 +258,15 @@ mod tests {
         let words = vec!["9Router".into(), " ".into(), "T3 Code".into()];
         assert_eq!(vocabulary_hint(&words).unwrap(), "9Router, T3 Code");
         assert!(vocabulary_hint(&[]).is_none());
+    }
+
+    #[test]
+    fn vocabulary_hint_is_bounded_and_deduplicated() {
+        let words = vec!["Cargo.toml".into(), "cargo.toml".into(), "pnpm".into()];
+        assert_eq!(vocabulary_hint(&words).unwrap(), "Cargo.toml, pnpm");
+        let many: Vec<String> = (0..200).map(|i| format!("term_{i:03}")).collect();
+        let hint = vocabulary_hint(&many).unwrap();
+        assert!(hint.chars().count() <= STT_HINT_CHARS);
+        assert!(hint.starts_with("term_000, term_001"), "first terms have priority");
     }
 }

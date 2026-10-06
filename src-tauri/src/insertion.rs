@@ -7,6 +7,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::Write;
 use std::os::fd::AsFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{wl_registry, wl_seat::WlSeat};
@@ -46,17 +47,50 @@ pub fn copy_to_clipboard(text: &str) -> Result<()> {
         .map_err(|e| anyhow!("Clipboard unavailable: {e}"))
 }
 
-pub fn insert(method: Method, text: &str) -> Result<()> {
+/// Where an insertion spent its time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InsertTiming {
+    /// Wayland connection and virtual keyboard creation (plus the paste settle delay).
+    pub setup_ms: u64,
+    /// Key events: typing every character, or the paste shortcut.
+    pub keys_ms: u64,
+    /// Publishing the clipboard selection.
+    pub clipboard_ms: u64,
+}
+
+fn ms(since: Instant) -> u64 {
+    since.elapsed().as_millis() as u64
+}
+
+pub fn insert(method: Method, text: &str) -> Result<InsertTiming> {
+    let mut timing = InsertTiming::default();
+    let started = Instant::now();
     match method {
-        Method::Clipboard => copy_to_clipboard(text),
-        Method::Type => VirtualKeyboard::connect()?.type_text(text),
+        Method::Clipboard => {
+            copy_to_clipboard(text)?;
+            timing.clipboard_ms = ms(started);
+        }
+        Method::Type => {
+            let keyboard = VirtualKeyboard::connect()?;
+            timing.setup_ms = ms(started);
+            let typing = Instant::now();
+            keyboard.type_text(text)?;
+            timing.keys_ms = ms(typing);
+        }
         Method::Paste | Method::PasteTerminal => {
             copy_to_clipboard(text)?;
+            timing.clipboard_ms = ms(started);
+            let setup = Instant::now();
             // Give the compositor a moment to announce the new selection to the focused client.
             std::thread::sleep(Duration::from_millis(60));
-            VirtualKeyboard::connect()?.paste(method == Method::PasteTerminal)
+            let keyboard = VirtualKeyboard::connect()?;
+            timing.setup_ms = ms(setup);
+            let keys = Instant::now();
+            keyboard.paste(method == Method::PasteTerminal)?;
+            timing.keys_ms = ms(keys);
         }
     }
+    Ok(timing)
 }
 
 struct State;
@@ -131,8 +165,17 @@ pub fn keymap(chars: &[char]) -> String {
         symbols += &format!("key <K{code}> {{ [ {} ] }};\n", keysym(*c));
     }
     let max = FIRST + chars.len() as u32 + 8;
+    // COSMIC ignores a keymap identical to the previous one, so a client focused since then
+    // reads our keycodes with the user's layout ("alpha" typed as "123"). A unique keycodes
+    // name makes every keymap distinct.
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let id = format!(
+        "vp{}-{}",
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    );
     format!(
-        "xkb_keymap {{\nxkb_keycodes \"vp\" {{ minimum = 8; maximum = {max};\n{codes}}};\n\
+        "xkb_keymap {{\nxkb_keycodes \"{id}\" {{ minimum = 8; maximum = {max};\n{codes}}};\n\
          xkb_types \"vp\" {{ include \"complete\" }};\nxkb_compatibility \"vp\" {{ include \"complete\" }};\n\
          xkb_symbols \"vp\" {{\n{symbols}}};\n}};\n"
     )
@@ -255,6 +298,11 @@ mod tests {
         assert!(map.contains("key <K10> { [ U00E9 ] };"));
         assert!(map.contains("key <K11> { [ Return ] };"));
         assert!(map.contains("maximum = 12;"));
+    }
+
+    #[test]
+    fn keymaps_are_distinct() {
+        assert_ne!(keymap(&['a']), keymap(&['a']));
     }
 
     #[test]

@@ -64,6 +64,15 @@ impl HistoryStore {
         Ok(self.connection.last_insert_rowid())
     }
 
+    /// Records the final latency once delivery finished (the entry is saved before delivery).
+    pub fn set_latency(&self, id: i64, latency_ms: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE history SET latency_ms = ?1 WHERE id = ?2",
+            params![latency_ms, id],
+        )?;
+        Ok(())
+    }
+
     pub fn list(&self, limit: u32) -> Result<Vec<Entry>> {
         let mut statement = self.connection.prepare(
             "SELECT id, created_at, raw, cleaned, mode, stt_model, cleanup_model, error, duration_ms, latency_ms
@@ -146,6 +155,8 @@ mod tests {
             list.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec![new, old]
         );
+        store.set_latency(new, 1234).unwrap();
+        assert_eq!(store.list(10).unwrap()[0].latency_ms, 1234);
         assert_eq!(store.prune(30, 100 * 86_400_000).unwrap(), 1);
         assert_eq!(store.prune(0, i64::MAX).unwrap(), 0);
         store.delete(new).unwrap();
