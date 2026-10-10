@@ -4,7 +4,7 @@
 # and a GTK window receives the text. The app runs from target/debug with an isolated
 # config/data dir (your settings and history are untouched; the keyring key is reused).
 # Override settings with VP_CLEANUP_MODEL, VP_REASONING_EFFORT, VP_STT_MODEL, VP_INSERTION_METHOD,
-# VP_STREAMING (1 = Deepgram live, 0 = batch only),
+# VP_STREAMING (1 = Deepgram live, 0 = batch only), VP_TARGET_TITLE (window title),
 # and the binaries with VP_DEBUG (a directory holding voice-prompt and examples/ptt).
 # Prints the app's latency lines. Needs a Wayland session; do not type while it runs.
 set -eu
@@ -50,4 +50,9 @@ for run in $(seq "$runs"); do
   done
 done
 grep -E " latency total=| WARN | outcome=| destination " "$home/data/voice-prompt/voice-prompt.log" || true
+# App resources over the whole run: peak RSS and CPU seconds (utime + stime).
+awk '/VmHWM/ {print "resources peak_rss_kb=" $2}' "/proc/$app/status"
+awk -v hz="$(getconf CLK_TCK)" '{print "resources cpu_s=" ($14 + $15) / hz}' "/proc/$app/stat"
+# Raw transcripts for WER and term accuracy (`run.py e2e-accuracy`).
+python3 -c 'import json,sqlite3,sys; [print("raw "+json.dumps({"stt_model":m,"raw":r})) for m,r in sqlite3.connect(sys.argv[1]).execute("select stt_model, raw from history order by id")]' "$home/data/voice-prompt/history.db"
 echo "--- received text:"; cat "$home/received"; echo

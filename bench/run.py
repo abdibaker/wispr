@@ -5,6 +5,7 @@
   python3 bench/run.py stt [--trials 3]           # STT models x vocabulary hints
   python3 bench/run.py cleanup [--trials 2]       # cleanup configurations vs raw baseline
   python3 bench/run.py latency LOG                # p50/p95 per stage from voice-prompt.log
+  python3 bench/run.py e2e-accuracy OUT CLIP...   # WER/terms of raw transcripts from e2e.sh
 
 Reads endpoint from ~/.config/voice-prompt/settings.json and the key from the keyring
 (or $VP_KEY). Writes JSON results under bench/results/. Stdlib only.
@@ -428,6 +429,22 @@ def latency(args):
             print(f"  {key:15} p50 {s['p50']:>6}  p95 {s['p95']:>6}  mean {s['mean']:>6}")
 
 
+def e2e_accuracy(args):
+    """WER and exact-term accuracy of the raw transcripts an `e2e.sh` run saved."""
+    cases = {str(audio_path(c).relative_to(HERE)): c for c in CORPUS["stt"]}
+    raws = [json.loads(l[4:]) for l in pathlib.Path(args.output).read_text().splitlines() if l.startswith("raw ")]
+    by_model = {}
+    for entry in raws:
+        # Cancelled presses shift the order, so pair each transcript with its closest clip.
+        case = min((cases[c] for c in args.clips), key=lambda c: wer(c["reference"], entry["raw"]))
+        hit = term_hits(case["terms"], entry["raw"])
+        group = by_model.setdefault(entry["stt_model"], {"wer": [], "hit": 0, "terms": 0})
+        group["wer"].append(wer(case["reference"], entry["raw"]))
+        group["hit"] += len(hit)
+        group["terms"] += len(case["terms"])
+    for model, g in by_model.items():
+        print(f"{model:32} n={len(g['wer']):>3} WER {statistics.mean(g['wer']):.3f}  terms {g['hit']}/{g['terms']}")
+
 def write(kind, records):
     RESULTS.mkdir(exist_ok=True)
     path = RESULTS / f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}.json"
@@ -454,6 +471,10 @@ def main():
     p.add_argument("--vocabulary", choices=["global", "relevant"], default="global",
                    help="global: the default list for every case (old app); relevant: only mentioned terms (app now)")
     p.set_defaults(run=cleanup)
+    p = sub.add_parser("e2e-accuracy")
+    p.add_argument("output", help="saved e2e.sh output")
+    p.add_argument("clips", nargs="+", help="the clips passed to e2e.sh, in order")
+    p.set_defaults(run=e2e_accuracy)
     p = sub.add_parser("latency")
     p.add_argument("log", nargs="?", default=str(pathlib.Path.home() / ".local/share/voice-prompt/voice-prompt.log"))
     p.set_defaults(run=latency)

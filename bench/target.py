@@ -5,7 +5,9 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib
 
 kind, out = sys.argv[1], sys.argv[2]
-window = Gtk.Window(title=f"vp-target-{kind}")
+import os
+# VP_TARGET_TITLE ("main.rs - wispr") makes the app treat the window as technical.
+window = Gtk.Window(title=os.environ.get("VP_TARGET_TITLE") or f"vp-target-{kind}")
 window.set_default_size(700, 400)
 if kind == "gtk":
     view = Gtk.TextView()
