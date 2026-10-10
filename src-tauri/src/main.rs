@@ -59,13 +59,15 @@ struct Latency {
     delivery: String,
     /// confirmed | changed | unknown: the press-time window versus the window at delivery.
     destination: &'static str,
-    /// streaming_deepgram | batch_fallback | batch (streaming off, or a retry)
+    /// streaming_deepgram | streaming_muse | batch_fallback | batch (streaming off, or a retry)
     stt_mode: &'static str,
     /// Why streaming produced no trusted transcript; empty unless `batch_fallback`.
     fallback_reason: &'static str,
     /// Streaming stages, in ms since key press; `None` when the stage never happened.
     token_ms: Option<u64>,
     connected_ms: Option<u64>,
+    /// The provider accepts audio: socket open (Deepgram), handshake acknowledged (Muse).
+    ready_ms: Option<u64>,
     first_sent_ms: Option<u64>,
     first_partial_ms: Option<u64>,
     first_final_ms: Option<u64>,
@@ -101,7 +103,7 @@ impl Latency {
              cleanup_norm={} cleanup_total={} cleanup_attempts={} history={} held_wait={} insert_setup={} \
              insert_keys={} clipboard={} untimed={} outcome={} delivery={} destination={} \
              stt_mode={} fallback_reason={} release_to_stt={} release_to_cleaned={} token={} \
-             connected={} first_sent={} first_partial={} first_final={} released={} last_sent={} \
+             connected={} ready={} first_sent={} first_partial={} first_final={} released={} last_sent={} \
              finalize_sent={}",
             self.release_to_delivered_ms,
             self.audio_ms,
@@ -137,6 +139,7 @@ impl Latency {
             na(self.release_to_cleaned_ms),
             na(self.token_ms),
             na(self.connected_ms),
+            na(self.ready_ms),
             na(self.first_sent_ms),
             na(self.first_partial_ms),
             na(self.first_final_ms),
@@ -291,11 +294,14 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
             let (vocabulary, technical) = context_vocabulary(&settings, target.as_ref());
             // The queue exists before token and connection work starts, so early speech is kept.
             let (stream, sink) = if settings.streaming {
-                let transcriber =
-                    streaming::DeepgramStreamingTranscriber::new(state.client.clone(), &settings);
                 use streaming::StreamingTranscriber;
                 let keyterms = if technical { &vocabulary[..] } else { &[] };
-                let (stream, sink) = transcriber.start(keyterms);
+                let (stream, sink) = if settings.streaming_provider == "muse" {
+                    streaming::MuseStreamingTranscriber::new(&settings).start(keyterms)
+                } else {
+                    streaming::DeepgramStreamingTranscriber::new(state.client.clone(), &settings)
+                        .start(keyterms)
+                };
                 (Some(stream), Some(sink))
             } else {
                 (None, None)
@@ -472,8 +478,10 @@ async fn process(
     };
     latency.stt_mode = "batch";
     let mut streamed = None;
+    let mut stt_model = settings.stt_model.clone();
     if let Some(stream) = stream {
         let stats = stream.stats.clone();
+        let provider = stream.provider;
         let finishing = Instant::now();
         let result = stream.finish(FINALIZE_DEADLINE).await;
         latency.stt_wait_ms = ms(finishing);
@@ -484,6 +492,7 @@ async fn process(
             let stats = *stats.lock().unwrap();
             latency.token_ms = since(stats.token);
             latency.connected_ms = since(stats.connected);
+            latency.ready_ms = since(stats.ready);
             latency.first_sent_ms = since(stats.first_sent);
             latency.first_partial_ms = since(stats.first_partial);
             latency.first_final_ms = since(stats.first_final);
@@ -499,7 +508,14 @@ async fn process(
                 latency.fallback_reason = "empty";
             }
             Ok(text) => {
-                latency.stt_mode = "streaming_deepgram";
+                (latency.stt_mode, stt_model) = if provider == "muse" {
+                    ("streaming_muse", format!("meta/{}", streaming::MUSE_MODEL))
+                } else {
+                    (
+                        "streaming_deepgram",
+                        format!("deepgram/{}", settings.streaming_model),
+                    )
+                };
                 streamed = Some(text);
             }
             Err(error) => {
@@ -623,11 +639,7 @@ async fn process(
             "raw"
         }
         .into(),
-        stt_model: if latency.stt_mode == "streaming_deepgram" {
-            format!("deepgram/{}", settings.streaming_model)
-        } else {
-            settings.stt_model.clone()
-        },
+        stt_model,
         cleanup_model: settings
             .cleanup_enabled
             .then(|| settings.cleanup_model.clone()),
@@ -832,6 +844,29 @@ fn has_api_key() -> CommandResult<bool> {
 #[tauri::command]
 fn set_api_key(key: String) -> CommandResult<()> {
     settings::secret::set(key.trim()).map_err(text_error)
+}
+
+#[tauri::command]
+fn has_muse_key() -> CommandResult<bool> {
+    settings::secret::get_for(settings::secret::MUSE)
+        .map(|k| k.is_some())
+        .map_err(text_error)
+}
+
+#[tauri::command]
+fn set_muse_key(key: String) -> CommandResult<()> {
+    settings::secret::set_for(settings::secret::MUSE, key.trim()).map_err(text_error)
+}
+
+/// Handshakes with Muse using the stored key, without sending audio.
+#[tauri::command]
+async fn test_muse() -> CommandResult<String> {
+    let started = Instant::now();
+    streaming::muse_check().await.map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Muse accepted the key ({} ms).",
+        started.elapsed().as_millis()
+    ))
 }
 
 #[tauri::command]
@@ -1153,6 +1188,9 @@ fn main() {
             save_settings,
             has_api_key,
             set_api_key,
+            has_muse_key,
+            set_muse_key,
+            test_muse,
             list_microphones,
             test_connection,
             history_list,

@@ -24,6 +24,8 @@ pub struct Settings {
     /// Stream audio to Deepgram while the key is held; batch STT stays the fallback.
     pub streaming: bool,
     pub streaming_model: String,
+    /// deepgram | muse (experimental)
+    pub streaming_provider: String,
     // Cleanup
     pub cleanup_enabled: bool,
     pub cleanup_model: String,
@@ -59,6 +61,7 @@ impl Default for Settings {
             language: "en".into(),
             streaming: true,
             streaming_model: "nova-3".into(),
+            streaming_provider: "deepgram".into(),
             cleanup_enabled: true,
             // Fastest model passing the full cleanup corpus (bench/results, 2026-10-09).
             cleanup_model: "claude-haiku-5-5".into(),
@@ -176,28 +179,39 @@ pub fn apply_autostart(enabled: bool) -> Result<()> {
 pub mod secret {
     use anyhow::Result;
     const SERVICE: &str = "voice-prompt";
-    const ACCOUNT: &str = "9router-api-key";
+    /// The 9Router key, which also mints Deepgram tokens.
+    pub const ROUTER: &str = "9router-api-key";
+    /// Meta Model API key for the experimental Muse provider; Muse has no token broker.
+    pub const MUSE: &str = "meta-muse-api-key";
 
-    fn entry() -> Result<keyring::Entry> {
-        Ok(keyring::Entry::new(SERVICE, ACCOUNT)?)
+    fn entry(account: &str) -> Result<keyring::Entry> {
+        Ok(keyring::Entry::new(SERVICE, account)?)
     }
 
     pub fn get() -> Result<Option<String>> {
-        match entry()?.get_password() {
+        get_for(ROUTER)
+    }
+
+    pub fn set(key: &str) -> Result<()> {
+        set_for(ROUTER, key)
+    }
+
+    pub fn get_for(account: &str) -> Result<Option<String>> {
+        match entry(account)?.get_password() {
             Ok(key) => Ok(Some(key)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
 
-    pub fn set(key: &str) -> Result<()> {
+    pub fn set_for(account: &str, key: &str) -> Result<()> {
         if key.is_empty() {
-            return match entry()?.delete_credential() {
+            return match entry(account)?.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
                 Err(error) => Err(error.into()),
             };
         }
-        Ok(entry()?.set_password(key)?)
+        Ok(entry(account)?.set_password(key)?)
     }
 }
 

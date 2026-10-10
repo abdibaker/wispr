@@ -15,6 +15,7 @@ type SettingsData = {
   language: string;
   streaming: boolean;
   streaming_model: string;
+  streaming_provider: string;
   cleanup_enabled: boolean;
   cleanup_model: string;
   reasoning_effort: string;
@@ -199,11 +200,36 @@ function Speech({ settings, update }: SectionProps) {
   const [key, setKey] = useState("");
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null);
   const [testing, setTesting] = useState(false);
+  const [hasMuseKey, setHasMuseKey] = useState(false);
+  const [museKey, setMuseKey] = useState("");
 
   useEffect(() => {
     invoke<Microphone[]>("list_microphones").then(setMicrophones).catch(() => setMicrophones([]));
     invoke<boolean>("has_api_key").then(setHasKey).catch(() => setHasKey(false));
+    invoke<boolean>("has_muse_key").then(setHasMuseKey).catch(() => setHasMuseKey(false));
   }, []);
+
+  const saveMuseKey = async () => {
+    try {
+      await invoke("set_muse_key", { key: museKey });
+      setMuseKey("");
+      setHasMuseKey(museKey.trim().length > 0);
+      setTest({ ok: true, text: museKey.trim() ? "Meta Muse key saved to the system keyring." : "Meta Muse key removed." });
+    } catch (error) {
+      setTest({ ok: false, text: String(error) });
+    }
+  };
+
+  const testMuse = async () => {
+    setTesting(true);
+    try {
+      setTest({ ok: true, text: await invoke<string>("test_muse") });
+    } catch (error) {
+      setTest({ ok: false, text: String(error) });
+    } finally {
+      setTesting(false);
+    }
+  };
 
   const saveKey = async () => {
     try {
@@ -267,9 +293,33 @@ function Speech({ settings, update }: SectionProps) {
       <Row label="Live transcription" hint="Streams audio to Deepgram while you speak. The model above is the fallback.">
         <Toggle checked={settings.streaming} onChange={(streaming) => update({ streaming })} />
       </Row>
+      <Row label="Live transcription provider">
+        <select value={settings.streaming_provider} onChange={(e) => update({ streaming_provider: e.target.value })}>
+          <option value="deepgram">Deepgram Nova-3</option>
+          <option value="muse">Meta Muse Voice Transcribe (experimental)</option>
+        </select>
+      </Row>
+      <Row label="Meta Muse API key" hint={hasMuseKey ? "Stored in the system keyring. Enter a new one to replace it." : "Not set. Only needed for Meta Muse."}>
+        <span className="inline">
+          <input
+            type="password"
+            autoComplete="off"
+            placeholder={hasMuseKey ? "••••••••" : "LLM_…"}
+            value={museKey}
+            onChange={(e) => setMuseKey(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && saveMuseKey()}
+          />
+          <button onClick={saveMuseKey} disabled={!museKey && !hasMuseKey}>
+            {museKey || !hasMuseKey ? "Save" : "Remove"}
+          </button>
+        </span>
+      </Row>
       <div className="actions">
         <button onClick={runTest} disabled={testing}>
           {testing ? "Testing…" : "Test connection"}
+        </button>
+        <button onClick={testMuse} disabled={testing || !hasMuseKey}>
+          Test Muse
         </button>
         {test ? <span className={test.ok ? "ok" : "error"}>{test.text}</span> : null}
       </div>
