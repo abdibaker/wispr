@@ -3,8 +3,9 @@
 # A temporary null sink stands in for the microphone, a uinput keyboard holds the shortcut,
 # and a GTK window receives the text. The app runs from target/debug with an isolated
 # config/data dir (your settings and history are untouched; the keyring key is reused).
-# Override settings with VP_CLEANUP_MODEL, VP_REASONING_EFFORT, VP_STT_MODEL, VP_INSERTION_METHOD,
-# VP_STREAMING (1 = Deepgram live, 0 = batch only), VP_TARGET_TITLE (window title),
+# Override settings with VP_CLEANUP_MODEL, VP_REASONING_EFFORT, VP_STT_MODEL, VP_INSERTION_METHOD, VP_LANGUAGE,
+# VP_STREAMING (1 = live, 0 = batch only), VP_PROVIDER (deepgram|muse), VP_VOCABULARY (JSON list),
+# VP_TARGET_TITLE (window title; "main.rs - wispr" makes the target technical),
 # and the binaries with VP_DEBUG (a directory holding voice-prompt and examples/ptt).
 # Prints the app's latency lines. Needs a Wayland session; do not type while it runs.
 set -eu
@@ -27,11 +28,15 @@ python3 - "$home/config/voice-prompt/settings.json" <<'PY'
 import json, pathlib, sys
 user = json.loads((pathlib.Path.home() / ".config/voice-prompt/settings.json").read_text())
 import os
-for key in ("cleanup_model", "reasoning_effort", "stt_model", "insertion_method"):
+for key in ("cleanup_model", "reasoning_effort", "stt_model", "insertion_method", "language"):
     if os.environ.get("VP_" + key.upper()):
         user[key] = os.environ["VP_" + key.upper()]
 if os.environ.get("VP_STREAMING"):
     user["streaming"] = os.environ["VP_STREAMING"] == "1"
+if os.environ.get("VP_PROVIDER"):
+    user["streaming_provider"] = os.environ["VP_PROVIDER"]
+if os.environ.get("VP_VOCABULARY"):
+    user["vocabulary"] = json.loads(os.environ["VP_VOCABULARY"])
 user.update(microphone="vp_bench.monitor", autostart=False, sounds=False, notifications=False, history_enabled=True)
 pathlib.Path(sys.argv[1]).write_text(json.dumps(user))
 PY
@@ -40,6 +45,7 @@ sleep 1.5
 XDG_CONFIG_HOME="$home/config" XDG_DATA_HOME="$home/data" "$debug/voice-prompt" --background >/dev/null 2>&1 & app=$!
 sleep 2
 kill -0 "$app" 2>/dev/null || { echo "benchmark app instance exited" >&2; exit 1; }
+echo "clips $clips"
 for run in $(seq "$runs"); do
   for clip in $clips; do
     hold=$(python3 -c "import wave,sys; w=wave.open(sys.argv[1]); print(int(w.getnframes()/w.getframerate()*1000)+400)" "$clip")
@@ -54,5 +60,5 @@ grep -E " latency total=| WARN | outcome=| destination " "$home/data/voice-promp
 awk '/VmHWM/ {print "resources peak_rss_kb=" $2}' "/proc/$app/status"
 awk -v hz="$(getconf CLK_TCK)" '{print "resources cpu_s=" ($14 + $15) / hz}' "/proc/$app/stat"
 # Raw transcripts for WER and term accuracy (`run.py e2e-accuracy`).
-python3 -c 'import json,sqlite3,sys; [print("raw "+json.dumps({"stt_model":m,"raw":r})) for m,r in sqlite3.connect(sys.argv[1]).execute("select stt_model, raw from history order by id")]' "$home/data/voice-prompt/history.db"
+python3 -c 'import json,sqlite3,sys; [print("raw "+json.dumps({"stt_model":m,"raw":r,"cleaned":c})) for m,r,c in sqlite3.connect(sys.argv[1]).execute("select stt_model, raw, cleaned from history order by id")]' "$home/data/voice-prompt/history.db"
 echo "--- received text:"; cat "$home/received"; echo

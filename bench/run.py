@@ -5,7 +5,7 @@
   python3 bench/run.py stt [--trials 3]           # STT models x vocabulary hints
   python3 bench/run.py cleanup [--trials 2]       # cleanup configurations vs raw baseline
   python3 bench/run.py latency LOG                # p50/p95 per stage from voice-prompt.log
-  python3 bench/run.py e2e-accuracy OUT CLIP...   # WER/terms of raw transcripts from e2e.sh
+  python3 bench/run.py e2e-report OUT...          # raw/cleaned accuracy and latency from e2e.sh
 
 Reads endpoint from ~/.config/voice-prompt/settings.json and the key from the keyring
 (or $VP_KEY). Writes JSON results under bench/results/. Stdlib only.
@@ -98,6 +98,7 @@ class Client:
             self.reset()
             return {"error": type(error).__name__, "ms": ms(started), "cold": cold}, {}
         out = {"status": response.status, "ms": ms(started), "cold": cold}
+        self.body = data
         try:
             parsed = json.loads(data)
         except ValueError:
@@ -135,12 +136,31 @@ def espeak(text, path):
                         "-ar", "16000", "-ac", "1", str(path)], check=True)
 
 
+def neural(text, voice, path):
+    """Neural TTS (edge-tts through 9Router): closer to human speech than espeak, still synthetic."""
+    client = Client()
+    out, _ = client.post("/audio/speech", json.dumps({"model": f"edge-tts/{voice}", "input": text}).encode(),
+                         "application/json")
+    if out.get("status") != 200:
+        sys.exit(f"TTS failed: {out}")
+    with tempfile.NamedTemporaryFile(suffix=".mp3") as mp3:
+        mp3.write(client.body)
+        mp3.flush()
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", mp3.name, "-af", "adelay=300,apad=pad_dur=0.3",
+                        "-ar", "16000", "-ac", "1", str(path)], check=True)
+
 def synth(_args):
     for case in CORPUS["stt"]:
+        path = audio_path(case)
         if "speak" in case:
-            path = HERE / "audio" / f"{case['id']}.wav"
             espeak(case["speak"], path)
-            print("wrote", path.relative_to(ROOT))
+        elif "voice" in case:
+            if path.exists():
+                continue
+            neural(case["say"], case["voice"], path)
+        else:
+            continue
+        print("wrote", path.relative_to(ROOT))
 
 
 def audio_path(case):
@@ -429,21 +449,101 @@ def latency(args):
             print(f"  {key:15} p50 {s['p50']:>6}  p95 {s['p95']:>6}  mean {s['mean']:>6}")
 
 
-def e2e_accuracy(args):
-    """WER and exact-term accuracy of the raw transcripts an `e2e.sh` run saved."""
-    cases = {str(audio_path(c).relative_to(HERE)): c for c in CORPUS["stt"]}
-    raws = [json.loads(l[4:]) for l in pathlib.Path(args.output).read_text().splitlines() if l.startswith("raw ")]
-    by_model = {}
-    for entry in raws:
-        # Cancelled presses shift the order, so pair each transcript with its closest clip.
-        case = min((cases[c] for c in args.clips), key=lambda c: wer(c["reference"], entry["raw"]))
-        hit = term_hits(case["terms"], entry["raw"])
-        group = by_model.setdefault(entry["stt_model"], {"wer": [], "hit": 0, "terms": 0})
-        group["wer"].append(wer(case["reference"], entry["raw"]))
-        group["hit"] += len(hit)
-        group["terms"] += len(case["terms"])
-    for model, g in by_model.items():
-        print(f"{model:32} n={len(g['wer']):>3} WER {statistics.mean(g['wer']):.3f}  terms {g['hit']}/{g['terms']}")
+def alignment(reference, hypothesis):
+    """Word-level substitutions, deletions and insertions (Levenshtein backtrace)."""
+    r, h = words(reference), words(hypothesis)
+    d = [[0] * (len(h) + 1) for _ in range(len(r) + 1)]
+    for i in range(len(r) + 1):
+        d[i][0] = i
+    for j in range(len(h) + 1):
+        d[0][j] = j
+    for i in range(1, len(r) + 1):
+        for j in range(1, len(h) + 1):
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (r[i - 1] != h[j - 1]))
+    i, j, subs, dels, ins = len(r), len(h), [], [], []
+    while i or j:
+        if i and j and d[i][j] == d[i - 1][j - 1] + (r[i - 1] != h[j - 1]):
+            if r[i - 1] != h[j - 1]:
+                subs.append((r[i - 1], h[j - 1]))
+            i, j = i - 1, j - 1
+        elif i and d[i][j] == d[i - 1][j] + 1:
+            dels.append(r[i - 1])
+            i -= 1
+        else:
+            ins.append(h[j - 1])
+            j -= 1
+    return subs, dels, ins
+
+def e2e_report(args):
+    """Raw and cleaned accuracy plus stage latency for each saved `e2e.sh` run.
+
+    Raw transcripts are scored before cleanup, so Haiku cannot hide STT errors. Cancelled
+    presses shift the order, so each transcript is paired with its closest reference."""
+    for output in args.outputs:
+        cases = [c for c in CORPUS["stt"] if audio_path(c).exists()]
+        text = pathlib.Path(output).read_text()
+        print(f"\n=== {output}")
+        raws = [json.loads(l[4:]) for l in text.splitlines() if l.startswith("raw ")]
+        # Only the clips this run played; a truncated transcript must not match a shorter clip.
+        played = next((l.split()[1:] for l in text.splitlines() if l.startswith("clips ")), None)
+        if played:
+            cases = [c for c in CORPUS["stt"] if str(audio_path(c).relative_to(HERE)) in played]
+        groups = {}
+        errors = {}
+        by_path = {str(audio_path(c).relative_to(HERE)): c for c in cases}
+        # With no cancelled presses the history is in play order; otherwise pair by closest text.
+        positional = played and len(raws) % len(played) == 0 and "outcome=cancelled" not in text
+        for index, entry in enumerate(raws):
+            if positional:
+                case = by_path[played[index % len(played)]]
+            else:
+                # Normalized by the longer side: plain WER favours long references for bad transcripts.
+                case = min(cases, key=lambda c: wer(c["reference"], entry["raw"]) * len(words(c["reference"]))
+                           / max(len(words(c["reference"])), len(words(entry["raw"])), 1))
+            kind = "real" if not case["synthetic"] else ("neural" if "voice" in case else "espeak")
+            g = groups.setdefault((entry["stt_model"], kind), {"wer": [], "hit": 0, "terms": 0, "clean_hit": 0,
+                                                              "subs": 0, "dels": 0, "ins": 0, "numbers": [0, 0]})
+            g["wer"].append(wer(case["reference"], entry["raw"]))
+            g["hit"] += len(term_hits(case["terms"], entry["raw"]))
+            g["clean_hit"] += len(term_hits(case["terms"], entry.get("cleaned") or entry["raw"]))
+            g["terms"] += len(case["terms"])
+            subs, dels, ins = alignment(case["reference"], entry["raw"])
+            g["subs"] += len(subs); g["dels"] += len(dels); g["ins"] += len(ins)
+            for term in case["terms"]:
+                if term.isdigit():
+                    g["numbers"][1] += 1
+                    g["numbers"][0] += contains(entry["raw"], term)
+                elif not contains(entry["raw"], term):
+                    errors.setdefault(entry["stt_model"], {}).setdefault(term, set()).add(
+                        " ".join(h for _, h in subs[:3]) or "(omitted)")
+        print(f"{'model':34} {'kind':7} {'n':>3} {'WER':>6} {'raw terms':>10} {'clean terms':>12} {'numbers':>8} {'sub/del/ins':>12}")
+        for (model, kind), g in sorted(groups.items()):
+            print(f"{model:34} {kind:7} {len(g['wer']):>3} {statistics.mean(g['wer']):>6.3f} "
+                  f"{g['hit']:>4}/{g['terms']:<5} {g['clean_hit']:>6}/{g['terms']:<5} "
+                  f"{g['numbers'][0]:>3}/{g['numbers'][1]:<4} {g['subs']:>4}/{g['dels']}/{g['ins']}")
+        for model, missed in errors.items():
+            print(f"  missed by {model}: " + "; ".join(f"{t}" for t in sorted(missed)))
+        rows = [dict(re.findall(r"(\w+)=(\d+)\b", l.split(" latency ", 1)[1])) for l in text.splitlines() if " latency total=" in l]
+        modes = re.findall(r"stt_mode=(\S+) fallback_reason=(\S+)", text)
+        counts = {}
+        for mode in modes:
+            counts[mode] = counts.get(mode, 0) + 1
+        print("modes: " + ", ".join(f"{m}/{r}={n}" for (m, r), n in sorted(counts.items())))
+        def span(name, a, b=None):
+            values = [int(r[a]) - (int(r[b]) if b else 0) for r in rows if a in r and (b is None or b in r)]
+            if values:
+                s = summary(values)
+                print(f"  {name:28} p50 {s['p50']:>6}  p95 {s['p95']:>6}  n {s['n']}")
+        span("press -> provider ready", "ready")
+        span("press -> first partial", "first_partial")
+        span("first audio sent -> partial", "first_partial", "first_sent")
+        span("release -> final STT", "release_to_stt")
+        span("release -> cleaned text", "release_to_cleaned")
+        span("release -> delivery", "total")
+        span("cleanup", "cleanup_total")
+        for line in text.splitlines():
+            if line.startswith("resources"):
+                print("  " + line)
 
 def write(kind, records):
     RESULTS.mkdir(exist_ok=True)
@@ -471,10 +571,9 @@ def main():
     p.add_argument("--vocabulary", choices=["global", "relevant"], default="global",
                    help="global: the default list for every case (old app); relevant: only mentioned terms (app now)")
     p.set_defaults(run=cleanup)
-    p = sub.add_parser("e2e-accuracy")
-    p.add_argument("output", help="saved e2e.sh output")
-    p.add_argument("clips", nargs="+", help="the clips passed to e2e.sh, in order")
-    p.set_defaults(run=e2e_accuracy)
+    p = sub.add_parser("e2e-report")
+    p.add_argument("outputs", nargs="+", help="saved e2e.sh outputs")
+    p.set_defaults(run=e2e_report)
     p = sub.add_parser("latency")
     p.add_argument("log", nargs="?", default=str(pathlib.Path.home() / ".local/share/voice-prompt/voice-prompt.log"))
     p.set_defaults(run=latency)
