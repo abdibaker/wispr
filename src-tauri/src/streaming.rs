@@ -246,6 +246,8 @@ fn listen_url(base: &str, model: &str, language: &str, keyterms: &[String]) -> S
             .append_pair("channels", "1")
             .append_pair("interim_results", "true")
             .append_pair("smart_format", "true")
+            // Streaming smart_format alone leaves most numbers as words.
+            .append_pair("numerals", "true")
             .append_pair(
                 "language",
                 if language.is_empty() || language == "auto" {
