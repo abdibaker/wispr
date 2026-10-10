@@ -65,6 +65,7 @@ impl Chord {
 
 /// Tracks chord state from key events of several keyboards. A key counts as down while any
 /// keyboard holds it, so releasing Ctrl on one keyboard keeps a Ctrl held on another.
+#[derive(Default)]
 pub struct Tracker {
     per_device: HashMap<String, HashSet<KeyCode>>,
     active: bool,
@@ -72,14 +73,6 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    pub fn new() -> Self {
-        Self {
-            per_device: HashMap::new(),
-            active: false,
-            cancelled: false,
-        }
-    }
-
     /// Releases every key of a device that went away.
     pub fn unplug(&mut self, chord: &Chord, device: &str) -> Vec<HotkeyEvent> {
         let stale: Vec<KeyCode> = self
@@ -152,7 +145,7 @@ impl HotkeyManager {
         std::thread::spawn(move || watch_devices(sender, watched));
         let tracker_chord = chord.clone();
         std::thread::spawn(move || {
-            let mut tracker = Tracker::new();
+            let mut tracker = Tracker::default();
             for (device, key, down) in receiver {
                 let events = {
                     let chord = tracker_chord.lock().unwrap();
@@ -290,7 +283,7 @@ mod tests {
     #[test]
     fn press_and_release_in_any_order() {
         let chord = parse("Ctrl+Super").unwrap();
-        let mut t = Tracker::new();
+        let mut t = Tracker::default();
         assert_eq!(t.key(&chord, "kb", K::KEY_LEFTCTRL, true), None);
         assert_eq!(t.key(&chord, "kb", K::KEY_LEFTMETA, true), Some(Pressed));
         assert_eq!(t.key(&chord, "kb", K::KEY_LEFTCTRL, false), Some(Released));
@@ -303,7 +296,7 @@ mod tests {
     #[test]
     fn other_key_cancels_until_all_released() {
         let chord = parse("Ctrl+Super").unwrap();
-        let mut t = Tracker::new();
+        let mut t = Tracker::default();
         t.key(&chord, "kb", K::KEY_LEFTCTRL, true);
         assert_eq!(t.key(&chord, "kb", K::KEY_LEFTMETA, true), Some(Pressed));
         assert_eq!(t.key(&chord, "kb", K::KEY_LEFT, true), Some(Cancelled));
@@ -323,7 +316,7 @@ mod tests {
     #[test]
     fn chord_not_started_when_other_key_already_held() {
         let chord = parse("Ctrl+Super").unwrap();
-        let mut t = Tracker::new();
+        let mut t = Tracker::default();
         t.key(&chord, "kb", K::KEY_C, true);
         t.key(&chord, "kb", K::KEY_LEFTCTRL, true);
         assert_eq!(t.key(&chord, "kb", K::KEY_LEFTMETA, true), None);
@@ -332,7 +325,7 @@ mod tests {
     #[test]
     fn key_held_on_another_keyboard_keeps_chord_active() {
         let chord = parse("Ctrl+Super").unwrap();
-        let mut t = Tracker::new();
+        let mut t = Tracker::default();
         t.key(&chord, "laptop", K::KEY_LEFTCTRL, true);
         assert_eq!(t.key(&chord, "usb", K::KEY_LEFTMETA, true), Some(Pressed));
         // Same key pressed on both keyboards, released on one: still held on the other.
@@ -344,7 +337,7 @@ mod tests {
     #[test]
     fn unplug_releases_only_that_keyboard() {
         let chord = parse("Ctrl+Super").unwrap();
-        let mut t = Tracker::new();
+        let mut t = Tracker::default();
         t.key(&chord, "laptop", K::KEY_LEFTCTRL, true);
         assert_eq!(t.key(&chord, "usb", K::KEY_LEFTMETA, true), Some(Pressed));
         assert_eq!(t.unplug(&chord, "usb"), vec![Released]);
