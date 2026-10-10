@@ -1,2 +1,22 @@
+# Dependencies and build output (Rust output: src-tauri/.gitignore)
 node_modules
 dist
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local secrets and env files
+*.env
+.env*
+!.env.example
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local agent tooling
+.kilo/
+.kilocode/

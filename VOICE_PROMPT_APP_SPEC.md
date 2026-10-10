@@ -51,11 +51,11 @@ My OpenAI-compatible 9Router base URL is:
 
 `https://llm.abdibaker.com/v1`
 
-Known transcription API: with temp token
+Known transcription API (key from the environment, never inline):
 
 ```bash
 curl -X POST https://llm.abdibaker.com/v1/audio/transcriptions \
-  -H "Authorization: Bearer sk-fa8349c892a75211-tjvur8-29958ee8" \
+  -H "Authorization: Bearer $NINE_ROUTER_KEY" \
   -F "file=@audio.mp3" \
   -F "model=groq/distil-whisper-large-v3-en" \
   -F "response_format=json"
