@@ -1,5 +1,5 @@
 //! SpeechProvider and PromptCleaner over OpenAI-compatible HTTP (9Router).
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
@@ -26,6 +26,61 @@ pub struct Transcript {
 pub struct Cleaned {
     pub text: String,
     pub timing: HttpTiming,
+    /// Requests sent, including the retry of a dropped connection.
+    pub attempts: u32,
+}
+
+/// Why a provider call failed, so logs never count a fallback as a fast success.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Failure {
+    Timeout,
+    Network,
+    RateLimited,
+    Http,
+    Malformed,
+    Truncated,
+    Empty,
+}
+
+impl Failure {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Network => "network",
+            Self::RateLimited => "rate_limited",
+            Self::Http => "http",
+            Self::Malformed => "malformed",
+            Self::Truncated => "truncated",
+            Self::Empty => "empty",
+        }
+    }
+
+    /// The failure kind carried by an error from this module, if any.
+    pub fn of(error: &anyhow::Error) -> Option<Self> {
+        error.downcast_ref::<ProviderError>().map(|e| e.kind)
+    }
+}
+
+#[derive(Debug)]
+pub struct ProviderError {
+    pub kind: Failure,
+    message: String,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+fn fail(kind: Failure, message: impl Into<String>) -> anyhow::Error {
+    ProviderError {
+        kind,
+        message: message.into(),
+    }
+    .into()
 }
 
 #[async_trait]
@@ -60,23 +115,36 @@ async fn check(response: reqwest::Response) -> Result<reqwest::Response> {
     }
     let body = response.text().await.unwrap_or_default();
     let detail: String = body.chars().take(300).collect();
-    match status.as_u16() {
-        401 | 403 => {
-            bail!("9Router rejected the API key ({status}). Update it in Settings → Speech.")
-        }
-        404 => bail!("Endpoint or model not found ({status}): {detail}"),
-        429 => bail!("Rate limited by provider ({status}). Try again shortly."),
-        _ => bail!("Provider error {status}: {detail}"),
-    }
+    Err(match status.as_u16() {
+        401 | 403 => fail(
+            Failure::Http,
+            format!("9Router rejected the API key ({status}). Update it in Settings → Speech."),
+        ),
+        404 => fail(
+            Failure::Http,
+            format!("Endpoint or model not found ({status}): {detail}"),
+        ),
+        429 => fail(
+            Failure::RateLimited,
+            format!("Rate limited by provider ({status}). Try again shortly."),
+        ),
+        _ => fail(Failure::Http, format!("Provider error {status}: {detail}")),
+    })
 }
 
 fn network_error(error: reqwest::Error) -> anyhow::Error {
     if error.is_timeout() {
-        anyhow!("Request timed out. Check your connection or raise the timeout in Advanced.")
+        fail(
+            Failure::Timeout,
+            "Request timed out. Check your connection or raise the timeout in Advanced.",
+        )
     } else if error.is_connect() {
-        anyhow!("Cannot reach the endpoint. Check the 9Router URL and your network.")
+        fail(
+            Failure::Network,
+            "Cannot reach the endpoint. Check the 9Router URL and your network.",
+        )
     } else {
-        anyhow!("Network error: {error}")
+        fail(Failure::Network, format!("Network error: {error}"))
     }
 }
 
@@ -129,8 +197,12 @@ impl SpeechProvider for OpenAiCompatible {
         struct Body {
             text: String,
         }
-        let body: Body = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow!("Unexpected transcription response: {e}"))?;
+        let body: Body = serde_json::from_slice(&bytes).map_err(|e| {
+            fail(
+                Failure::Malformed,
+                format!("Unexpected transcription response: {e}"),
+            )
+        })?;
         let text = body.text.trim().to_string();
         timing.normalize_ms = ms(parsed);
         Ok(Transcript { text, timing })
@@ -174,31 +246,50 @@ impl PromptCleaner for OpenAiCompatible {
         if !self.reasoning_effort.is_empty() && self.reasoning_effort != "none" {
             body["reasoning_effort"] = self.reasoning_effort.clone().into();
         }
-        let request = self
-            .client
-            .post(format!(
-                "{}/chat/completions",
-                self.base_url.trim_end_matches('/')
-            ))
-            .bearer_auth(&self.api_key)
-            .timeout(self.timeout)
-            .json(&body);
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let mut timing = HttpTiming {
             setup_ms: ms(started),
             ..Default::default()
         };
-        let sent = Instant::now();
-        let response = check(request.send().await.map_err(network_error)?).await?;
-        timing.wait_ms = ms(sent);
+        let mut attempts = 0;
+        let response = loop {
+            attempts += 1;
+            let sent = Instant::now();
+            let result = self
+                .client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .timeout(self.timeout.saturating_sub(started.elapsed()))
+                .json(&body)
+                .send()
+                .await;
+            timing.wait_ms += ms(sent);
+            match result {
+                // A pooled connection the server already closed fails before any response;
+                // one fresh attempt is cheap. Timeouts and HTTP errors are not retried.
+                Err(error) if attempts == 1 && !error.is_timeout() && error.is_request() => {
+                    log::debug!("cleanup request failed, retrying once: {error}");
+                }
+                result => break check(result.map_err(network_error)?).await?,
+            }
+        };
         let received = Instant::now();
         let bytes = response.bytes().await.map_err(network_error)?;
         timing.body_ms = ms(received);
         let parsed = Instant::now();
-        let json: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow!("Unexpected cleanup response: {e}"))?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+            fail(
+                Failure::Malformed,
+                format!("Unexpected cleanup response: {e}"),
+            )
+        })?;
         let text = cleaned_text(&json, raw)?;
         timing.normalize_ms = ms(parsed);
-        Ok(Cleaned { text, timing })
+        Ok(Cleaned {
+            text,
+            timing,
+            attempts,
+        })
     }
 }
 
@@ -207,13 +298,23 @@ impl PromptCleaner for OpenAiCompatible {
 pub fn cleaned_text(json: &serde_json::Value, raw: &str) -> Result<String> {
     let choice = &json["choices"][0];
     match choice["finish_reason"].as_str() {
-        Some("length") => bail!("Cleanup output was cut off (token limit)"),
-        Some("content_filter") => bail!("Cleanup output was blocked by the provider's filter"),
+        Some("length") => {
+            return Err(fail(
+                Failure::Truncated,
+                "Cleanup output was cut off (token limit)",
+            ))
+        }
+        Some("content_filter") => {
+            return Err(fail(
+                Failure::Truncated,
+                "Cleanup output was blocked by the provider's filter",
+            ))
+        }
         _ => {}
     }
     let content = choice["message"]["content"]
         .as_str()
-        .ok_or_else(|| anyhow!("Cleanup response had no content"))?;
+        .ok_or_else(|| fail(Failure::Malformed, "Cleanup response had no content"))?;
     // Keep leading indentation (code); drop only blank leading lines and trailing whitespace.
     let mut text = content.trim_end();
     let first_line = text.find(|c: char| c != '\n' && c != '\r' && !c.is_whitespace());
@@ -232,7 +333,7 @@ pub fn cleaned_text(json: &serde_json::Value, raw: &str) -> Result<String> {
         _ => text,
     };
     if text.trim().is_empty() {
-        bail!("Cleanup returned empty text");
+        return Err(fail(Failure::Empty, "Cleanup returned empty text"));
     }
     Ok(text.to_string())
 }
@@ -262,6 +363,7 @@ pub fn wav(samples: &[i16], rate: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     fn completion(content: &str, finish: &str) -> serde_json::Value {
         serde_json::json!({"choices": [{"message": {"content": content}, "finish_reason": finish}]})
@@ -273,6 +375,21 @@ mod tests {
         assert!(cleaned_text(&json, "first requirement and second").is_err());
         assert!(cleaned_text(&completion("x", "content_filter"), "x").is_err());
         assert!(cleaned_text(&completion("  \n ", "stop"), "x").is_err());
+    }
+
+    #[test]
+    fn failures_are_classified() {
+        let kind = |json: serde_json::Value| Failure::of(&cleaned_text(&json, "raw").unwrap_err());
+        assert_eq!(
+            kind(completion("Only half", "length")),
+            Some(Failure::Truncated)
+        );
+        assert_eq!(kind(completion(" ", "stop")), Some(Failure::Empty));
+        assert_eq!(
+            kind(serde_json::json!({"choices": []})),
+            Some(Failure::Malformed)
+        );
+        assert_eq!(Failure::of(&anyhow!("other")), None);
     }
 
     #[test]
@@ -293,7 +410,10 @@ mod tests {
     #[test]
     fn echoed_wrapper_is_removed() {
         let json = completion("<transcript>\nFix the bug.\n</transcript>", "stop");
-        assert_eq!(cleaned_text(&json, "um fix the bug").unwrap(), "Fix the bug.");
+        assert_eq!(
+            cleaned_text(&json, "um fix the bug").unwrap(),
+            "Fix the bug."
+        );
     }
 
     #[test]

@@ -159,7 +159,10 @@ impl HotkeyManager {
                     if key == KeyCode::KEY_RESERVED {
                         tracker.unplug(&chord, &device)
                     } else {
-                        tracker.key(&chord, &device, key, down).into_iter().collect()
+                        tracker
+                            .key(&chord, &device, key, down)
+                            .into_iter()
+                            .collect()
                     }
                 };
                 for event in events {
@@ -346,6 +349,9 @@ mod tests {
         assert_eq!(t.key(&chord, "usb", K::KEY_LEFTMETA, true), Some(Pressed));
         assert_eq!(t.unplug(&chord, "usb"), vec![Released]);
         assert!(t.unplug(&chord, "usb").is_empty());
-        assert_eq!(t.key(&chord, "laptop", K::KEY_LEFTMETA, true), Some(Pressed));
+        assert_eq!(
+            t.key(&chord, "laptop", K::KEY_LEFTMETA, true),
+            Some(Pressed)
+        );
     }
 }

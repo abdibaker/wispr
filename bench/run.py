@@ -18,6 +18,8 @@ CORPUS = json.loads((HERE / "corpus.json").read_text())
 RESULTS = HERE / "results"
 
 STT_MODELS = ["groq/whisper-large-v3-turbo", "groq/whisper-large-v3"]
+# Prose clips whose transcripts must not gain vocabulary terms.
+CONTAMINATION = ["Codex", "T3 Code", "Claude Code", "9Router", "TanStack", "Tailscale", "Coolify", "shadcn"]
 # (model, reasoning_effort). "" omits the field, as the app does for "none".
 CLEANUP_CONFIGS = [
     ("gpt-6-luna", "low"),  # current default
@@ -28,6 +30,9 @@ CLEANUP_CONFIGS = [
     ("groq/qwen/qwen3-32b", ""),
     ("glm-5.3-flash", ""),
     ("gemini-3.8-flash", ""),
+    ("claude-haiku-5-5", ""),  # thinking off
+    ("claude-haiku-5-5", "low"),
+    ("claude-sonnet-5-5", ""),
 ]
 
 
@@ -60,10 +65,13 @@ class Client:
         self.conn = None
 
     def post(self, path, body, content_type, timeout=60):
-        """Paced and retried on 429: Groq allows 20 requests/minute per Whisper model."""
+        """Paced and retried on 429: Groq allows 20 requests/minute per Whisper model.
+        `wall_ms` covers every attempt and wait, so retried rows are not reported as fast."""
+        started = None
         for attempt in range(4):
             if self.pace:
                 time.sleep(max(0, self.last + self.pace - time.monotonic()))
+            started = started or time.perf_counter()  # pacing before the first attempt is ours, not the user's
             self.last = time.monotonic()
             out, parsed = self._post(path, body, content_type, timeout)
             if out.get("status") != 429:
@@ -71,6 +79,7 @@ class Client:
             print(f"  429, waiting 30 s (attempt {attempt + 1})", file=sys.stderr, flush=True)
             time.sleep(30)
         out["attempts"] = attempt + 1
+        out["wall_ms"] = ms(started)
         return out, parsed
 
     def _post(self, path, body, content_type, timeout):
@@ -210,15 +219,19 @@ def stt(args):
     client.pace = args.pace
     hints = {"none": "", "default": hint(CORPUS["vocabulary"]["default"]),
              "extended": hint(CORPUS["vocabulary"]["extended"])}
+    # "contextual": the app sends the extended hint only into technical windows (editor,
+    # terminal, file in the title); prose clips stand for dictation elsewhere and get none.
     records = []
     for trial in range(args.trials):
         for case in CORPUS["stt"]:
             audio = audio_path(case).read_bytes()
-            for model in STT_MODELS:
+            for model in args.models:
                 for hint_name in args.hints:
                     fields = {"model": model, "response_format": "json", "language": "en"}
-                    if hints[hint_name]:
-                        fields["prompt"] = hints[hint_name]
+                    text_hint = (hints["extended"] if case["id"].startswith("tech") else "") \
+                        if hint_name == "contextual" else hints[hint_name]
+                    if text_hint:
+                        fields["prompt"] = text_hint
                     if args.cold:
                         client.reset()
                     receipt, parsed = client.post("/audio/transcriptions", *multipart(audio, fields))
@@ -227,6 +240,8 @@ def stt(args):
                               "hint": hint_name, **receipt, "text": text}
                     if "error" not in receipt:
                         record["wer"] = round(wer(case["reference"], text), 3)
+                        if not case["id"].startswith("tech"):
+                            record["contaminated"] = [t for t in CONTAMINATION if contains(text, t, case=False)]
                         record["terms"] = f"{len(term_hits(case['terms'], text))}/{len(case['terms'])}"
                     records.append(record)
                     print(json.dumps(record), flush=True)
@@ -236,8 +251,8 @@ def stt(args):
 
 def report_stt(records):
     ok = [r for r in records if "error" not in r]
-    print(f"\n{'model':32} {'hint':9} {'n':>3} {'p50':>6} {'p95':>6} {'WER real':>9} {'WER synth':>9} {'terms':>7} {'errors':>6}")
-    for model in STT_MODELS:
+    print(f"\n{'model':32} {'hint':10} {'n':>3} {'p50':>6} {'p95':>6} {'WER real':>9} {'WER synth':>9} {'terms':>7} {'errors':>6} {'contam':>6}")
+    for model in dict.fromkeys(r["model"] for r in records):
         for hint_name in sorted({r["hint"] for r in records}):
             group = [r for r in ok if r["model"] == model and r["hint"] == hint_name]
             errors = sum(1 for r in records if r["model"] == model and r["hint"] == hint_name and "error" in r)
@@ -248,18 +263,61 @@ def report_stt(records):
             hit = sum(int(r["terms"].split("/")[0]) for r in group)
             total = sum(int(r["terms"].split("/")[1]) for r in group)
             lat = summary([r["ms"] for r in group])
-            print(f"{model:32} {hint_name:9} {lat['n']:>3} {lat['p50']:>6} {lat['p95']:>6} "
+            contaminated = sum(1 for r in group if r.get("contaminated"))
+            print(f"{model:32} {hint_name:10} {lat['n']:>3} {lat['p50']:>6} {lat['p95']:>6} "
                   f"{statistics.mean(real) if real else 0:>9.3f} {statistics.mean(synth_) if synth_ else 0:>9.3f} "
-                  f"{hit:>3}/{total:<3} {errors:>6}")
+                  f"{hit:>3}/{total:<3} {errors:>6} {contaminated:>6}")
 
 
 # ---------- cleanup ----------
 
-def system_prompt(vocabulary):
+def system_prompt(vocabulary, extra=""):
+    """Mirror of OpenAiCompatible::clean's system message."""
     source = (ROOT / "src-tauri/src/providers.rs").read_text()
     prompt = source.split('pub const CLEANUP_SYSTEM_PROMPT: &str = "', 1)[1].split('";', 1)[0]
     prompt = prompt.replace("\\\n", "").replace('\\"', '"')
-    return prompt + "\nVocabulary: " + ", ".join(vocabulary)
+    if vocabulary:
+        prompt += "\nVocabulary: " + ", ".join(vocabulary)
+    if extra.strip():
+        prompt += "\nAdditional user preferences: " + extra.strip()
+    return prompt
+
+
+def squash(text):
+    return "".join(c for c in text.lower() if c.isalnum())
+
+
+def distance(a, b):
+    row = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        prev, row[0] = row[0], i
+        for j, y in enumerate(b, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (x != y))
+    return row[len(b)]
+
+
+def relevant(vocabulary, transcript, limit=24):
+    """Mirror of settings::relevant_terms."""
+    words = [w for w in (squash(t) for t in transcript.split()) if w and w not in ("dot", "slash", "dash", "underscore")]
+    out, seen = [], set()
+    for term in (t.strip() for t in vocabulary):
+        key = squash(term)
+        if not key or term.lower() in seen:
+            continue
+        seen.add(term.lower())
+        for start in range(len(words)):
+            run, hit = "", False
+            for joined, word in enumerate(words[start:start + 4]):
+                run += word
+                n = len(key)
+                allowed = n // 4 if n >= 8 else 1 if n >= 5 and joined else 0
+                if abs(len(run) - n) <= allowed and distance(run, key) <= allowed:
+                    hit = True
+                    break
+            if hit:
+                out.append(term)
+                break
+    return out[:limit]
 
 
 def judge(case, output):
@@ -288,7 +346,11 @@ def judge(case, output):
 def cleanup(args):
     client = Client()
     client.pace = args.pace
-    system = system_prompt(CORPUS["vocabulary"]["default"])
+    # --app-instructions appends the stored cleanup_instructions, as the app does.
+    extra = settings().get("cleanup_instructions", "") if args.app_instructions else ""
+    vocabulary = CORPUS["vocabulary"]["extended"]
+    prompt_for = (lambda case: system_prompt(CORPUS["vocabulary"]["default"], extra)) if args.vocabulary == "global" \
+        else (lambda case: system_prompt(relevant(vocabulary, case["raw"]), extra))
     records = []
     for case in CORPUS["cleanup"]:  # raw/no-cleanup baseline: 0 ms, judged on the raw text
         records.append({"config": "raw (no cleanup)", "trial": 0, "case": case["id"], "ms": 0,
@@ -296,10 +358,10 @@ def cleanup(args):
     configs = [c for c in CLEANUP_CONFIGS if not args.only or c[0] in args.only]
     for trial in range(args.trials):
         for model, effort in configs:
-            name = f"{model} effort={effort or 'omitted'}"
+            name = f"{model} effort={effort or 'omitted'} vocab={args.vocabulary}"
             for case in CORPUS["cleanup"]:
                 body = {"model": model, "stream": False, "messages": [
-                    {"role": "system", "content": system},
+                    {"role": "system", "content": prompt_for(case)},
                     {"role": "user", "content": f"<transcript>\n{case['raw']}\n</transcript>"}]}
                 if effort:
                     body["reasoning_effort"] = effort
@@ -324,7 +386,8 @@ def report_cleanup(records):
     for name in dict.fromkeys(r["config"] for r in records):
         group = [r for r in records if r["config"] == name]
         errors = sum(1 for r in group if "error" in r)
-        lat = summary([r["ms"] for r in group if "error" not in r])
+        # Wall time across retries; failed attempts still cost the user that time.
+        lat = summary([r.get("wall_ms", r["ms"]) for r in group])
         passed = sum(1 for r in group if not r["failures"])
         failed = sorted({f"{r['case']}: {'; '.join(r['failures'])}" for r in group if r["failures"]})
         print(f"{name:48} {lat['n']:>3} {lat['p50'] or 0:>6} {lat['p95'] or 0:>6} {passed:>3}/{len(group):<3} {errors:>6}  "
@@ -334,12 +397,25 @@ def report_cleanup(records):
 # ---------- app log ----------
 
 def latency(args):
-    rows = []
+    rows, labels = [], []
     for line in pathlib.Path(args.log).read_text().splitlines():
         if " latency total=" in line:
-            rows.append({k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line.split(" latency ", 1)[1])})
+            fields = line.split(" latency ", 1)[1]
+            # first_audio=na means no chunk arrived: absent, not zero.
+            rows.append({k: int(v) for k, v in re.findall(r"(\w+)=(\d+)\b", fields)})
+            labels.append(dict(re.findall(r"(outcome|delivery|destination)=(\S+)", fields)))
     if not rows:
         sys.exit("no new-format latency lines")
+    for key in ("outcome", "delivery", "destination"):
+        counts = {}
+        for label in labels:
+            counts[label.get(key, "unlogged")] = counts.get(label.get(key, "unlogged"), 0) + 1
+        print(f"{key}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    # Only successful cleanups describe cleanup latency; fallbacks are counted above.
+    cleaned = [r for r, label in zip(rows, labels) if label.get("outcome", "cleaned") == "cleaned"]
+    if len(cleaned) != len(rows):
+        print(f"stage timings below use the {len(cleaned)} cleaned dictations of {len(rows)}")
+        rows = cleaned
     cold = [r for r in rows if r.get("idle", 0) > 90_000]
     warm = [r for r in rows if r.get("idle", 0) <= 90_000]
     for label, group in (("all", rows), ("cold (idle > 90 s)", cold), ("warm", warm)):
@@ -365,7 +441,8 @@ def main():
     sub.add_parser("synth").set_defaults(run=synth)
     p = sub.add_parser("stt")
     p.add_argument("--trials", type=int, default=3)
-    p.add_argument("--hints", nargs="+", default=["none", "default", "extended"])
+    p.add_argument("--hints", nargs="+", default=["none", "default", "extended", "contextual"])
+    p.add_argument("--models", nargs="+", default=STT_MODELS)
     p.add_argument("--cold", action="store_true", help="new connection per request")
     p.add_argument("--pace", type=float, default=3.5, help="seconds between requests (rate limit)")
     p.set_defaults(run=stt)
@@ -373,6 +450,9 @@ def main():
     p.add_argument("--trials", type=int, default=2)
     p.add_argument("--only", nargs="*", help="model names to include")
     p.add_argument("--pace", type=float, default=0.0, help="seconds between requests (rate limit)")
+    p.add_argument("--app-instructions", action="store_true", help="append the stored cleanup_instructions")
+    p.add_argument("--vocabulary", choices=["global", "relevant"], default="global",
+                   help="global: the default list for every case (old app); relevant: only mentioned terms (app now)")
     p.set_defaults(run=cleanup)
     p = sub.add_parser("latency")
     p.add_argument("log", nargs="?", default=str(pathlib.Path.home() / ".local/share/voice-prompt/voice-prompt.log"))

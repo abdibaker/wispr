@@ -29,7 +29,7 @@ pub struct Recording {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<Result<Vec<i16>>>,
     /// When the first chunk of audio arrived (capture latency instrumentation).
-    pub first_sample: Arc<OnceLock<Instant>>,
+    first_sample: Arc<OnceLock<Instant>>,
 }
 
 impl Recording {
@@ -92,11 +92,17 @@ impl Recording {
         })
     }
 
-    pub fn finish(self) -> Result<Vec<i16>> {
+    /// Stops capture and returns the samples plus when the first chunk arrived. The
+    /// timestamp is read after the join, so a chunk that arrived during it is not missed;
+    /// `None` means no audio arrived at all.
+    pub fn finish(self) -> (Result<Vec<i16>>, Option<Instant>) {
         self.stop.store(true, Ordering::Relaxed);
-        self.handle
+        let samples = self
+            .handle
             .join()
-            .map_err(|_| anyhow!("Recording thread panicked"))?
+            .map_err(|_| anyhow!("Recording thread panicked"))
+            .and_then(|r| r);
+        (samples, self.first_sample.get().copied())
     }
 }
 

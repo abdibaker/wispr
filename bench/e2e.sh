@@ -3,13 +3,14 @@
 # A temporary null sink stands in for the microphone, a uinput keyboard holds the shortcut,
 # and a GTK window receives the text. The app runs from target/debug with an isolated
 # config/data dir (your settings and history are untouched; the keyring key is reused).
-# Override settings with VP_CLEANUP_MODEL, VP_REASONING_EFFORT, VP_STT_MODEL, VP_INSERTION_METHOD.
+# Override settings with VP_CLEANUP_MODEL, VP_REASONING_EFFORT, VP_STT_MODEL, VP_INSERTION_METHOD,
+# and the binaries with VP_DEBUG (a directory holding voice-prompt and examples/ptt).
 # Prints the app's latency lines. Needs a Wayland session; do not type while it runs.
 set -eu
 cd "$(dirname "$0")"
 runs=${1:-3}; shift || true
 clips=${*:-audio/en-self-casual.wav audio/tech-numbers.wav}
-debug=../src-tauri/target/debug
+debug=${VP_DEBUG:-../src-tauri/target/debug}
 # Tauri's single-instance lock would hand our shortcut presses to the running app instead.
 if pgrep -x voice-prompt >/dev/null; then echo "quit the running Voice Prompt first" >&2; exit 1; fi
 home=$(mktemp -d)
@@ -45,5 +46,5 @@ for run in $(seq "$runs"); do
     sleep "${VP_GAP:-12}"  # STT + cleanup + typing; stay under Groq's 20 requests/minute (VP_GAP=100 for cold runs)
   done
 done
-grep -E " latency total=| WARN " "$home/data/voice-prompt/voice-prompt.log" || true
+grep -E " latency total=| WARN | outcome=| destination " "$home/data/voice-prompt/voice-prompt.log" || true
 echo "--- received text:"; cat "$home/received"; echo

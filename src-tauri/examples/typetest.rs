@@ -2,6 +2,9 @@
 #[path = "../src/insertion.rs"]
 #[allow(dead_code)]
 mod insertion;
+#[path = "../src/target.rs"]
+#[allow(dead_code)]
+mod target;
 
 fn main() -> anyhow::Result<()> {
     insertion::insert(

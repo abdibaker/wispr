@@ -4951,8 +4951,11 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tempfile",
  "tokio",
+ "wayland-backend",
  "wayland-client",
+ "wayland-protocols",
  "wayland-protocols-misc",
+ "wayland-scanner",
  "wl-clipboard-rs",
 ]
 

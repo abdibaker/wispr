@@ -446,8 +446,12 @@ function Advanced({ settings, update }: SectionProps) {
   return (
     <section>
       <h1>Advanced</h1>
-      <Row label="Insertion method" hint="Paste methods overwrite the clipboard.">
+      <Row
+        label="Insertion method"
+        hint="Paste methods overwrite the clipboard. Text goes only to the window active when you pressed the shortcut; if it changed, the text is copied instead."
+      >
         <select value={settings.insertion_method} onChange={(e) => update({ insertion_method: e.target.value })}>
+          <option value="auto">Automatic (paste; Ctrl+Shift+V in terminals)</option>
           <option value="type">Type (virtual keyboard)</option>
           <option value="paste">Paste with Ctrl+V</option>
           <option value="paste-terminal">Paste with Ctrl+Shift+V (terminals)</option>

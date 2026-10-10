@@ -72,6 +72,24 @@
      "exact": ["network.rs", "429"], "max_ratio": 1.5},
     {"id": "long-requirements", "raw": "Okay so, um, I want you to add a retry to the upload, uh, use exponential backoff starting at 200 milliseconds, cap it at 5 attempts, and, you know, only retry on 429 and 503, not on 400. Also log each attempt at debug level but don't log the request body because it has the API key. And, uh, add a test for the 503 case.",
      "all": [["200"], ["5 attempts", "five attempts", "5 retries", "maximum of 5", "max of 5", "cap it at 5", "at most 5", "capped at 5", "up to 5"], ["429"], ["503"], ["400"], ["debug"], ["don't log the request body", "do not log the request body", "not log the request body", "never log the request body", "without logging the request body", "don't log the body", "do not log the body", "exclude the request body", "excluding the request body"], ["api key"], ["test"]],
-     "none": ["you know", " um", " uh"], "min_ratio": 0.6}
+     "none": ["you know", " um", " uh"], "min_ratio": 0.6},
+    {"id": "correction-day", "raw": "deploy tomorrow—no, change that to Monday",
+     "all": [["monday"]], "none": ["tomorrow", "change that", "no,"], "max_ratio": 1.2},
+    {"id": "identifiers-packages", "raw": "Um, add @tanstack/react-query to package.json, then check src-tauri/src/main.rs and Cargo.toml, and keep 9Router as the gateway.",
+     "exact": ["@tanstack/react-query", "package.json", "src-tauri/src/main.rs", "Cargo.toml", "9Router"], "none": ["um"]},
+    {"id": "filler", "raw": "So, um, like, I think we should, uh, you know, rename the settings page to preferences.",
+     "all": [["preferences"], ["rename"], ["settings page"]], "none": ["um", "uh", "you know"], "min_ratio": 0.4},
+    {"id": "negation-unless", "raw": "Never delete the history database, and do not run migrations unless I say so.",
+     "all": [["never delete"], ["do not run", "don't run"], ["unless i say so", "unless i tell you"]]},
+    {"id": "code-literal", "raw": "Change the line to const retries = 3; and keep the semicolon.",
+     "exact": ["const retries = 3;"]},
+    {"id": "literal-punctuation", "raw": "Type this exactly: Hello, World! (v2.0) and don't change the punctuation.",
+     "exact": ["Hello, World! (v2.0)"]},
+    {"id": "git-command", "raw": "Run git commit -m \"fix: handle 429\" and then git push origin main.",
+     "exact": ["git commit -m \"fix: handle 429\"", "git push origin main"]},
+    {"id": "quantity-correction", "raw": "Allocate two point five gigabytes, no wait, make it four gigabytes, for 10 workers.",
+     "all": [["4 gb", "4gb", "four gigabytes", "4 gigabytes"], ["10 workers", "ten workers"]], "none": ["2.5", "two point five", "no wait"]},
+    {"id": "prose-vocabulary", "raw": "The art of war, then, is governed by five constant factors, to be taken into account in one's deliberations.",
+     "all": [["art of war"], ["five constant factors"]], "none": ["codex", "t3 code", "claude code", "9router", "tanstack", "tailscale", "coolify", "shadcn"]}
   ]
 }

@@ -55,8 +55,10 @@ impl Default for Settings {
             stt_model: "groq/whisper-large-v3-turbo".into(),
             language: "en".into(),
             cleanup_enabled: true,
-            cleanup_model: "gpt-6-luna".into(),
-            reasoning_effort: "low".into(),
+            // Fastest model passing the full cleanup corpus (bench/results, 2026-10-09).
+            cleanup_model: "claude-haiku-5-5".into(),
+            // Omits the field: Haiku answers without thinking.
+            reasoning_effort: "none".into(),
             cleanup_instructions: String::new(),
             vocabulary: [
                 "9Router",
@@ -224,6 +226,96 @@ pub fn vocabulary_hint(vocabulary: &[String]) -> Option<String> {
     (!hint.is_empty()).then_some(hint)
 }
 
+/// Most terms the cleanup prompt receives; relevant ones only, so prose is not steered
+/// toward product names.
+pub const CLEANUP_TERMS: usize = 24;
+
+/// Letters and digits, lowercased: "9 router", "9Router" and "9-router" compare equal.
+fn squash(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.iter().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let current = row[j + 1];
+            row[j + 1] = (previous + (x != y) as usize)
+                .min(row[j] + 1)
+                .min(current + 1);
+            previous = current;
+        }
+    }
+    row[b.len()]
+}
+
+/// Whether the transcript plausibly mentions `term`, spelled right or as STT heard it
+/// ("tense tack" for TanStack): some run of up to four words is within a small edit
+/// distance of the term. A single word must match exactly unless the term is long, so
+/// "code" does not select "Codex".
+fn mentions(words: &[String], term: &str) -> bool {
+    let key: Vec<char> = squash(term).chars().collect();
+    if key.is_empty() {
+        return false;
+    }
+    (0..words.len()).any(|start| {
+        let mut run = String::new();
+        words[start..]
+            .iter()
+            .take(4)
+            .enumerate()
+            .any(|(joined, word)| {
+                run.push_str(word);
+                let run: Vec<char> = run.chars().collect();
+                // A lone common word one edit away ("request" for reqwest) is not evidence.
+                let allowed = match key.len() {
+                    n if n >= 8 => n / 4,
+                    5..=7 if joined > 0 => 1,
+                    _ => 0,
+                };
+                run.len().abs_diff(key.len()) <= allowed && edit_distance(&run, &key) <= allowed
+            })
+    })
+}
+
+/// Vocabulary terms the transcript appears to mention, in list order, at most `CLEANUP_TERMS`.
+pub fn relevant_terms<'a>(vocabulary: &'a [String], transcript: &str) -> Vec<&'a str> {
+    // Spoken separators ("cargo dot toml") carry no letters of the written term.
+    let words: Vec<String> = transcript
+        .split_whitespace()
+        .map(squash)
+        .filter(|w| !w.is_empty() && !["dot", "slash", "dash", "underscore"].contains(&w.as_str()))
+        .collect();
+    vocabulary_terms(vocabulary)
+        .into_iter()
+        .filter(|term| mentions(&words, term))
+        .take(CLEANUP_TERMS)
+        .collect()
+}
+
+/// File names in a window title ("main.rs - wispr - Visual Studio Code"), which are likely
+/// to be dictated in that window.
+pub fn title_terms(title: &str) -> Vec<String> {
+    title
+        .split(|c: char| c.is_whitespace() || "—–|•()[]\"'".contains(c))
+        .map(|t| t.trim_matches(|c: char| ",:;!?*".contains(c)))
+        .filter(|t| {
+            let (stem, extension) = t.rsplit_once('.').unwrap_or_default();
+            !stem.is_empty()
+                && (1..=5).contains(&extension.len())
+                && extension.chars().all(|c| c.is_ascii_alphanumeric())
+                && extension.chars().any(|c| c.is_ascii_alphabetic())
+        })
+        .map(String::from)
+        .take(4)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +359,93 @@ mod tests {
         let many: Vec<String> = (0..200).map(|i| format!("term_{i:03}")).collect();
         let hint = vocabulary_hint(&many).unwrap();
         assert!(hint.chars().count() <= STT_HINT_CHARS);
-        assert!(hint.starts_with("term_000, term_001"), "first terms have priority");
+        assert!(
+            hint.starts_with("term_000, term_001"),
+            "first terms have priority"
+        );
+    }
+
+    fn list(terms: &[&str]) -> Vec<String> {
+        terms.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn technical_speech_selects_mentioned_terms() {
+        let vocabulary = list(&[
+            "9Router",
+            "T3 Code",
+            "Tailscale",
+            "TanStack",
+            "shadcn",
+            "Coolify",
+            "Codex",
+            "Claude Code",
+            "Cargo.toml",
+            "@tanstack/react-query",
+            "reqwest",
+        ]);
+        assert_eq!(
+            relevant_terms(
+                &vocabulary,
+                "Use T3 code with 9 router and tense tack for the dashboard."
+            ),
+            ["9Router", "T3 Code", "TanStack"]
+        );
+        assert_eq!(
+            relevant_terms(
+                &vocabulary,
+                "Update cargo dot toml and add tanstack react query, keep reqwest."
+            ),
+            ["TanStack", "Cargo.toml", "@tanstack/react-query", "reqwest"]
+        );
+        assert!(relevant_terms(&vocabulary, "Don't log the request body.").is_empty());
+    }
+
+    #[test]
+    fn unrelated_prose_selects_nothing() {
+        let vocabulary = list(&[
+            "9Router",
+            "T3 Code",
+            "Tailscale",
+            "TanStack",
+            "shadcn",
+            "Coolify",
+            "Codex",
+            "Claude Code",
+            "wispr",
+            "pnpm",
+            "evdev",
+            "COSMIC",
+        ]);
+        for prose in [
+            "The art of war, then, is governed by five constant factors, to be taken into account in one's deliberations.",
+            "That Jane was yielding to the preference which she had begun to entertain for him from the first.",
+            "Let's go to the Chinese restaurant tonight, but please do not bring Sam, you know, he is very annoying.",
+            "Can you send me the report by Friday? The code of conduct says we close at five.",
+        ] {
+            assert!(relevant_terms(&vocabulary, prose).is_empty(), "{prose}");
+        }
+    }
+
+    #[test]
+    fn relevant_terms_are_bounded() {
+        let many: Vec<String> = (0..100).map(|i| format!("term{i:03}")).collect();
+        let transcript = many.join(" ");
+        assert_eq!(relevant_terms(&many, &transcript).len(), CLEANUP_TERMS);
+    }
+
+    #[test]
+    fn title_file_names() {
+        assert_eq!(
+            title_terms("main.rs - wispr - Visual Studio Code"),
+            ["main.rs"]
+        );
+        assert_eq!(
+            title_terms("● Cargo.toml — src-tauri (settings.json)"),
+            ["Cargo.toml", "settings.json"]
+        );
+        assert!(title_terms("GroqCloud - Google Chrome").is_empty());
+        assert!(title_terms("abdibaker@hmydev: ~ — COSMIC Terminal").is_empty());
+        assert!(title_terms("Version 2.0 released").is_empty());
     }
 }

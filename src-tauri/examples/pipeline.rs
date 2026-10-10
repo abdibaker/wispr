@@ -8,6 +8,9 @@ mod providers;
 #[path = "../src/settings.rs"]
 #[allow(dead_code)]
 mod settings;
+#[path = "../src/target.rs"]
+#[allow(dead_code)]
+mod target;
 
 use providers::*;
 use std::time::{Duration, Instant};
@@ -44,7 +47,11 @@ async fn main() -> anyhow::Result<()> {
     let cleaned = cleaner
         .clean(&transcript.text, &defaults.vocabulary, "")
         .await?;
-    println!("Cleanup {} ms: {}", started.elapsed().as_millis(), cleaned.text);
+    println!(
+        "Cleanup {} ms: {}",
+        started.elapsed().as_millis(),
+        cleaned.text
+    );
     if args.iter().any(|a| a == "--type") {
         std::thread::sleep(Duration::from_secs(2));
         insertion::insert(insertion::Method::Type, &cleaned.text)?;
