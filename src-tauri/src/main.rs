@@ -1,162 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-mod audio;
-mod history;
-mod hotkey;
-mod insertion;
-mod logger;
-mod providers;
-mod settings;
-mod streaming;
-mod target;
-
 use anyhow::{anyhow, Result};
-use history::{Entry, HistoryStore};
-use hotkey::{HotkeyEvent, HotkeyManager};
-use providers::{OpenAiCompatible, PromptCleaner, SpeechProvider};
 use serde::Serialize;
-use settings::Settings;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
-
-/// Per-dictation stage timings, logged as one `latency` line (`bench/run.py latency` summarizes them).
-#[derive(Serialize, Clone, Default, Debug)]
-struct Latency {
-    hotkey_to_capture_ms: u64,
-    /// `None` when no audio chunk arrived; never logged as zero.
-    capture_to_first_audio_ms: Option<u64>,
-    finish_ms: u64,
-    keyring_ms: u64,
-    wav_ms: u64,
-    stt_setup_ms: u64,
-    stt_wait_ms: u64,
-    stt_read_ms: u64,
-    stt_normalize_ms: u64,
-    cleanup_setup_ms: u64,
-    cleanup_wait_ms: u64,
-    cleanup_read_ms: u64,
-    cleanup_normalize_ms: u64,
-    /// Wall time of the cleanup step, including retries and a failed attempt.
-    cleanup_total_ms: u64,
-    cleanup_attempts: u32,
-    history_ms: u64,
-    held_wait_ms: u64,
-    insert_setup_ms: u64,
-    insert_keys_ms: u64,
-    clipboard_ms: u64,
-    /// Release → text delivered; the sum of the stages above plus untimed glue.
-    release_to_delivered_ms: u64,
-    audio_ms: u64,
-    /// Time since the previous provider request; above the 90 s pool timeout the
-    /// connection is cold.
-    idle_ms: u64,
-    /// cleaned | raw (cleanup off) | fallback_<failure> | stt_<failure> | empty
-    outcome: String,
-    /// typed | pasted | pasted_terminal | copied_<reason> | failed
-    delivery: String,
-    /// confirmed | changed | unknown: the press-time window versus the window at delivery.
-    destination: &'static str,
-    /// streaming_deepgram | streaming_muse | batch_fallback | batch (streaming off, or a retry)
-    stt_mode: &'static str,
-    /// Why streaming produced no trusted transcript; empty unless `batch_fallback`.
-    fallback_reason: &'static str,
-    /// Streaming stages, in ms since key press; `None` when the stage never happened.
-    token_ms: Option<u64>,
-    connected_ms: Option<u64>,
-    /// The provider accepts audio: socket open (Deepgram), handshake acknowledged (Muse).
-    ready_ms: Option<u64>,
-    first_sent_ms: Option<u64>,
-    first_partial_ms: Option<u64>,
-    first_final_ms: Option<u64>,
-    released_ms: Option<u64>,
-    last_sent_ms: Option<u64>,
-    finalize_sent_ms: Option<u64>,
-    /// Release → complete raw transcript, whichever path produced it.
-    release_to_stt_ms: Option<u64>,
-    /// Release → cleaned (or raw fallback) text ready for delivery.
-    release_to_cleaned_ms: Option<u64>,
-}
-
-impl Latency {
-    fn log(&self, chars: usize) {
-        let na = |value: Option<u64>| value.map_or("na".into(), |ms| ms.to_string());
-        let first_audio = na(self.capture_to_first_audio_ms);
-        let timed = self.finish_ms
-            + self.keyring_ms
-            + self.wav_ms
-            + self.stt_setup_ms
-            + self.stt_wait_ms
-            + self.stt_read_ms
-            + self.stt_normalize_ms
-            + self.cleanup_total_ms
-            + self.history_ms
-            + self.held_wait_ms
-            + self.insert_setup_ms
-            + self.insert_keys_ms
-            + self.clipboard_ms;
-        log::info!(
-            "latency total={} audio={} chars={} idle={} capture={} first_audio={} finish={} keyring={} wav={} \
-             stt_setup={} stt_wait={} stt_read={} stt_norm={} cleanup_setup={} cleanup_wait={} cleanup_read={} \
-             cleanup_norm={} cleanup_total={} cleanup_attempts={} history={} held_wait={} insert_setup={} \
-             insert_keys={} clipboard={} untimed={} outcome={} delivery={} destination={} \
-             stt_mode={} fallback_reason={} release_to_stt={} release_to_cleaned={} token={} \
-             connected={} ready={} first_sent={} first_partial={} first_final={} released={} last_sent={} \
-             finalize_sent={}",
-            self.release_to_delivered_ms,
-            self.audio_ms,
-            chars,
-            self.idle_ms,
-            self.hotkey_to_capture_ms,
-            first_audio,
-            self.finish_ms,
-            self.keyring_ms,
-            self.wav_ms,
-            self.stt_setup_ms,
-            self.stt_wait_ms,
-            self.stt_read_ms,
-            self.stt_normalize_ms,
-            self.cleanup_setup_ms,
-            self.cleanup_wait_ms,
-            self.cleanup_read_ms,
-            self.cleanup_normalize_ms,
-            self.cleanup_total_ms,
-            self.cleanup_attempts,
-            self.history_ms,
-            self.held_wait_ms,
-            self.insert_setup_ms,
-            self.insert_keys_ms,
-            self.clipboard_ms,
-            self.release_to_delivered_ms.saturating_sub(timed),
-            or_na(&self.outcome),
-            or_na(&self.delivery),
-            or_na(self.destination),
-            or_na(self.stt_mode),
-            or_na(self.fallback_reason),
-            na(self.release_to_stt_ms),
-            na(self.release_to_cleaned_ms),
-            na(self.token_ms),
-            na(self.connected_ms),
-            na(self.ready_ms),
-            na(self.first_sent_ms),
-            na(self.first_partial_ms),
-            na(self.first_final_ms),
-            na(self.released_ms),
-            na(self.last_sent_ms),
-            na(self.finalize_sent_ms),
-        );
-    }
-}
-
-fn or_na(label: &str) -> &str {
-    if label.is_empty() {
-        "na"
-    } else {
-        label
-    }
-}
+use voice_prompt::history::{now_ms, Entry, HistoryStore};
+use voice_prompt::hotkey::{self, HotkeyEvent, HotkeyManager};
+use voice_prompt::pipeline::{Latency, Outcome, Pipeline, Recording, Snapshot};
+use voice_prompt::settings::{self, Settings};
+use voice_prompt::{audio, delivery, insertion, logger, providers, streaming, target};
 
 fn ms(since: Instant) -> u64 {
     since.elapsed().as_millis() as u64
@@ -186,30 +41,18 @@ struct Session {
     pressed: Instant,
     capture_started: Instant,
     latency: Latency,
-    /// The window active at key press: the intended destination.
-    target: Option<target::Window>,
+    snapshot: Snapshot,
     /// Live transcription; dropping it cancels the socket without finalizing.
     stream: Option<streaming::StreamSession>,
-    /// Chosen at press from the target window; see `context_vocabulary`.
-    vocabulary: Vec<String>,
-    technical: bool,
 }
 
 struct AppState {
     settings: Mutex<Settings>,
-    history: Mutex<HistoryStore>,
-    hotkey: Mutex<Option<HotkeyManager>>,
+    pipeline: Pipeline,
+    hotkey: Arc<Mutex<Option<HotkeyManager>>>,
     hotkey_error: Mutex<Option<String>>,
     recording: Mutex<Option<Session>>,
-    /// Kept in memory only, so a failed STT call can be retried without re-speaking.
-    failed_audio: Mutex<Option<Vec<i16>>>,
-    /// The last finished prompt, so text whose insertion failed can still be recovered
-    /// (tray → Copy last prompt) even with history disabled.
-    last_prompt: Mutex<Option<String>>,
     busy: Arc<AtomicBool>,
-    latency: Mutex<Option<Latency>>,
-    started: Instant,
-    last_request: Mutex<Option<Instant>>,
     client: reqwest::Client,
     /// COSMIC active-window tracking; `None` on compositors without the protocols.
     windows: Option<target::Tracker>,
@@ -220,13 +63,6 @@ struct OverlayState {
     state: &'static str,
     level: f32,
     message: String,
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
 }
 
 fn overlay(app: &AppHandle, state: &'static str, message: impl Into<String>) {
@@ -290,24 +126,19 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
             let pressed = Instant::now();
             // Before the overlay or any cue can disturb focus.
             let target = state.windows.as_ref().and_then(target::Tracker::active);
-            let settings = state.settings.lock().unwrap().clone();
-            let (vocabulary, technical) = context_vocabulary(&settings, target.as_ref());
+            let snapshot = Snapshot::take(state.settings.lock().unwrap().clone(), target);
+            let settings = &snapshot.settings;
             // The queue exists before token and connection work starts, so early speech is kept.
             let (stream, sink) = if settings.streaming {
-                use streaming::StreamingTranscriber;
-                let keyterms = if technical { &vocabulary[..] } else { &[] };
-                let (stream, sink) = if settings.streaming_provider == "muse" {
-                    streaming::MuseStreamingTranscriber::new(&settings).start(keyterms)
-                } else {
-                    streaming::DeepgramStreamingTranscriber::new(state.client.clone(), &settings)
-                        .start(keyterms)
-                };
+                let (stream, sink) =
+                    streaming::start(state.client.clone(), settings, snapshot.keyterms());
                 (Some(stream), Some(sink))
             } else {
                 (None, None)
             };
             let capture_started = Instant::now();
             let level_app = app.clone();
+            let sounds = settings.sounds;
             match audio::Recording::start(
                 &settings.microphone,
                 settings.max_record_secs,
@@ -328,22 +159,18 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
                 },
             ) {
                 Ok(recording) => {
-                    let latency = Latency {
-                        hotkey_to_capture_ms: ms(pressed),
-                        ..Default::default()
-                    };
+                    let mut latency = Latency::default();
+                    latency.hotkey_to_capture_ms = ms(pressed);
                     *state.recording.lock().unwrap() = Some(Session {
                         busy,
                         recording,
                         pressed,
                         capture_started,
                         latency,
-                        target,
+                        snapshot,
                         stream,
-                        vocabulary,
-                        technical,
                     });
-                    if settings.sounds {
+                    if sounds {
                         audio::beep(880.0, 60);
                     }
                     overlay(app, "recording", "");
@@ -379,426 +206,81 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
                     .saturating_duration_since(session.capture_started)
                     .as_millis() as u64
             });
-            if state.settings.lock().unwrap().sounds {
+            if session.snapshot.settings.sounds {
                 audio::beep(660.0, 60);
             }
-            let busy = session.busy;
-            let held = released - session.pressed;
-            let dictation = Dictation {
+            let recording = samples.map(|samples| Recording {
+                samples,
                 pressed: Some(session.pressed),
                 released,
-                held,
-                target: session.target,
+                held: released - session.pressed,
                 stream: session.stream,
-                vocabulary: session.vocabulary,
-                technical: session.technical,
-            };
+                latency,
+            });
+            let busy = session.busy;
+            let snapshot = session.snapshot;
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let result = match samples {
-                    Ok(samples) => process(&app, samples, latency, dictation).await,
-                    Err(error) => Err(error),
-                };
-                drop(busy);
-                if let Err(error) = result {
-                    log::warn!("dictation failed: {error:#}");
-                    overlay(&app, "error", format!("{error}"));
-                    notify(&app, &format!("{error}"));
-                    hide_overlay_later(&app, 4000);
+                match recording {
+                    Ok(recording) => process(&app, &snapshot, recording).await,
+                    Err(error) => report(&app, &error),
                 }
+                drop(busy);
             });
         }
     }
 }
 
-/// Deepgram's flush after CloseStream normally takes a few hundred ms; past this the
-/// session is untrusted and the retained recording goes to batch STT.
-const FINALIZE_DEADLINE: Duration = Duration::from_secs(3);
-
-/// Window file names plus the global vocabulary, and whether STT should be biased toward
-/// them. A global STT hint steers unrelated prose toward product names, so STT gets terms
-/// only where technical dictation is likely: editors, terminals, and windows showing a
-/// file. Cleanup always filters the list to terms the transcript mentions.
-fn context_vocabulary(settings: &Settings, target: Option<&target::Window>) -> (Vec<String>, bool) {
-    let mut vocabulary = target.map_or(vec![], |w| settings::title_terms(&w.title));
-    let technical = !vocabulary.is_empty() || target.is_some_and(target::Window::is_technical);
-    vocabulary.extend(settings.vocabulary.iter().cloned());
-    (vocabulary, technical)
+fn report(app: &AppHandle, error: &anyhow::Error) {
+    log::warn!("dictation failed: {error:#}");
+    overlay(app, "error", format!("{error}"));
+    notify(app, &format!("{error}"));
+    hide_overlay_later(app, 4000);
 }
 
-/// One recording on its way to delivery.
-struct Dictation {
-    /// `None` for a retry, which has no live session.
-    pressed: Option<Instant>,
-    released: Instant,
-    held: Duration,
-    target: Option<target::Window>,
-    stream: Option<streaming::StreamSession>,
-    vocabulary: Vec<String>,
-    technical: bool,
-}
-
-/// The voice pipeline: STT → optional cleanup → insertion, never dropping a successful transcript.
-async fn process(
-    app: &AppHandle,
-    samples: Vec<i16>,
-    mut latency: Latency,
-    dictation: Dictation,
-) -> Result<()> {
-    let Dictation {
-        pressed,
-        released,
-        held,
-        target,
-        stream,
-        vocabulary,
-        technical,
-    } = dictation;
+/// Runs the pipeline and shows how it went.
+async fn process(app: &AppHandle, snapshot: &Snapshot, recording: Recording) {
     let state = app.state::<AppState>();
-    let settings = state.settings.lock().unwrap().clone();
-    let audio_ms = samples.len() as u64 * 1000 / audio::RATE as u64;
-    latency.audio_ms = audio_ms;
-    if held.as_millis() < settings.min_hold_ms as u128 || audio::is_silent(&samples) {
-        overlay(app, "hidden", "");
-        return Ok(());
-    }
-    let started = Instant::now();
-    let api_key = settings::secret::get()?
-        .ok_or_else(|| anyhow!("No 9Router API key. Open Voice Prompt settings → Speech."))?;
-    latency.keyring_ms = ms(started);
-    overlay(app, "transcribing", "");
-    latency.idle_ms = ms(state.last_request.lock().unwrap().unwrap_or(state.started));
-    let stt = OpenAiCompatible {
-        client: state.client.clone(),
-        base_url: settings.endpoint.clone(),
-        api_key: api_key.clone(),
-        model: settings.stt_model.clone(),
-        timeout: Duration::from_secs(settings.stt_timeout_secs),
-        reasoning_effort: String::new(),
-    };
-    latency.stt_mode = "batch";
-    let mut streamed = None;
-    let mut stt_model = settings.stt_model.clone();
-    if let Some(stream) = stream {
-        let stats = stream.stats.clone();
-        let provider = stream.provider;
-        let finishing = Instant::now();
-        let result = stream.finish(FINALIZE_DEADLINE).await;
-        latency.stt_wait_ms = ms(finishing);
-        if let Some(pressed) = pressed {
-            let since = |at: Option<Instant>| {
-                at.map(|at| at.saturating_duration_since(pressed).as_millis() as u64)
-            };
-            let stats = *stats.lock().unwrap();
-            latency.token_ms = since(stats.token);
-            latency.connected_ms = since(stats.connected);
-            latency.ready_ms = since(stats.ready);
-            latency.first_sent_ms = since(stats.first_sent);
-            latency.first_partial_ms = since(stats.first_partial);
-            latency.first_final_ms = since(stats.first_final);
-            latency.released_ms = since(Some(released));
-            latency.last_sent_ms = since(stats.last_sent);
-            latency.finalize_sent_ms = since(stats.finalize_sent);
+    let outcome = state
+        .pipeline
+        .run(snapshot, recording, |stage| overlay(app, stage, ""))
+        .await;
+    match outcome {
+        Err(error) => return report(app, &error),
+        Ok(Outcome::Ignored) => return overlay(app, "hidden", ""),
+        Ok(Outcome::Empty) => {
+            overlay(app, "error", "Nothing recognised");
+            return hide_overlay_later(app, 1500);
         }
-        match result {
-            // Metadata arrived but nothing was finalized for audio that is not silent:
-            // let batch STT have a go rather than report "nothing recognised".
-            Ok(text) if text.is_empty() => {
-                latency.stt_mode = "batch_fallback";
-                latency.fallback_reason = "empty";
-            }
-            Ok(text) => {
-                (latency.stt_mode, stt_model) = if provider == "muse" {
-                    ("streaming_muse", format!("meta/{}", streaming::MUSE_MODEL))
-                } else {
-                    (
-                        "streaming_deepgram",
-                        format!("deepgram/{}", settings.streaming_model),
-                    )
-                };
-                streamed = Some(text);
-            }
-            Err(error) => {
-                latency.stt_mode = "batch_fallback";
-                latency.fallback_reason = streaming::reason(&error);
-            }
-        }
-        if streamed.is_none() {
-            log::warn!(
-                "streaming STT failed ({}); replaying the full recording to batch STT",
-                latency.fallback_reason
-            );
-        }
-    }
-    let result = match streamed {
-        Some(text) => Ok(providers::Transcript {
-            text,
-            timing: Default::default(),
-        }),
-        None => {
-            let encoding = Instant::now();
-            let wav = providers::wav(&samples, audio::RATE);
-            latency.wav_ms = ms(encoding);
-            let hint = technical
-                .then(|| settings::vocabulary_hint(&vocabulary))
-                .flatten();
-            stt.transcribe(wav, &settings.language, hint).await
-        }
-    };
-    latency.release_to_stt_ms = Some(ms(released));
-    let transcript = match result {
-        Ok(transcript) => {
-            *state.failed_audio.lock().unwrap() = None;
-            latency.stt_setup_ms = transcript.timing.setup_ms;
-            latency.stt_wait_ms += transcript.timing.wait_ms;
-            latency.stt_read_ms = transcript.timing.body_ms;
-            latency.stt_normalize_ms = transcript.timing.normalize_ms;
-            transcript
-        }
-        Err(error) => {
-            *state.failed_audio.lock().unwrap() = Some(samples);
-            latency.outcome = format!(
-                "stt_{}",
-                providers::Failure::of(&error).map_or("error", providers::Failure::name)
-            );
-            latency.delivery = "none".into();
-            latency.release_to_delivered_ms = ms(released);
-            latency.log(0);
-            return Err(error.context("Transcription failed (use tray → Retry last recording)"));
-        }
-    };
-    drop(samples);
-    *state.last_request.lock().unwrap() = Some(Instant::now());
-    if transcript.text.is_empty() {
-        latency.outcome = "empty".into();
-        latency.delivery = "none".into();
-        latency.release_to_delivered_ms = ms(released);
-        latency.log(0);
-        overlay(app, "error", "Nothing recognised");
-        hide_overlay_later(app, 1500);
-        return Ok(());
-    }
-
-    let mut cleanup_error = None;
-    let mut cleaned = None;
-    if settings.cleanup_enabled {
-        overlay(app, "cleaning", "");
-        let cleaner = OpenAiCompatible {
-            model: settings.cleanup_model.clone(),
-            timeout: Duration::from_secs(settings.cleanup_timeout_secs),
-            reasoning_effort: settings.reasoning_effort.clone(),
-            ..stt
-        };
-        // Only terms the transcript appears to mention, so prose is not rewritten toward them.
-        let terms: Vec<String> = settings::relevant_terms(&vocabulary, &transcript.text)
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let cleaning = Instant::now();
-        let result = cleaner
-            .clean(&transcript.text, &terms, &settings.cleanup_instructions)
-            .await;
-        latency.cleanup_total_ms = ms(cleaning);
-        match result {
-            Ok(result) => {
-                latency.cleanup_setup_ms = result.timing.setup_ms;
-                latency.cleanup_wait_ms = result.timing.wait_ms;
-                latency.cleanup_read_ms = result.timing.body_ms;
-                latency.cleanup_normalize_ms = result.timing.normalize_ms;
-                latency.cleanup_attempts = result.attempts;
-                latency.outcome = "cleaned".into();
-                cleaned = Some(result.text);
-            }
-            Err(error) => {
-                log::warn!("cleanup failed, using raw transcript: {error:#}");
-                latency.outcome = format!(
-                    "fallback_{}",
-                    providers::Failure::of(&error).map_or("error", providers::Failure::name)
-                );
-                cleanup_error = Some(format!("{error}"));
-            }
-        }
-    } else {
-        latency.outcome = "raw".into();
-    }
-    *state.last_request.lock().unwrap() = Some(Instant::now());
-    latency.release_to_cleaned_ms = Some(ms(released));
-    let prompt = cleaned.clone().unwrap_or_else(|| transcript.text.clone());
-    *state.last_prompt.lock().unwrap() = Some(prompt.clone());
-
-    // Save first: insertion problems (or a hung compositor) must never lose the prompt.
-    let saving = Instant::now();
-    let entry = Entry {
-        id: 0,
-        created_at: now_ms(),
-        raw: transcript.text.clone(),
-        cleaned: cleaned.clone(),
-        mode: if settings.cleanup_enabled {
-            "clean"
-        } else {
-            "raw"
-        }
-        .into(),
-        stt_model,
-        cleanup_model: settings
-            .cleanup_enabled
-            .then(|| settings.cleanup_model.clone()),
-        error: cleanup_error.clone(),
-        duration_ms: audio_ms as i64,
-        latency_ms: released.elapsed().as_millis() as i64,
-    };
-    let saved = if settings.history_enabled {
-        state
-            .history
-            .lock()
-            .unwrap()
-            .add(&entry)
-            .map_err(|error| log::warn!("history write failed: {error:#}"))
-            .ok()
-    } else {
-        None
-    };
-    latency.history_ms = ms(saving);
-
-    let delivered = deliver(app, &settings, &prompt, target.as_ref(), &mut latency).await;
-    if delivered.is_err() {
-        latency.delivery = "failed".into();
-    }
-    latency.release_to_delivered_ms = ms(released);
-    latency.log(prompt.chars().count());
-    if let Some(id) = saved {
-        let history = state.history.lock().unwrap();
-        let _ = history.set_latency(id, latency.release_to_delivered_ms as i64);
-        let _ = history.prune(settings.history_retention_days, now_ms());
-    }
-    *state.latency.lock().unwrap() = Some(latency);
-    let _ = app.emit("history-changed", ());
-
-    match (delivered, cleanup_error) {
-        (Ok(how), None) => overlay(app, "done", how),
-        (Ok(how), Some(_)) => overlay(
+        Ok(Outcome::Delivered {
+            message,
+            cleanup_failed: false,
+        }) => overlay(app, "done", message),
+        Ok(Outcome::Delivered {
+            message,
+            cleanup_failed: true,
+        }) => overlay(
             app,
             "warning",
-            format!("Cleanup failed, raw text {}", how.to_lowercase()),
+            format!("Cleanup failed, raw text {}", message.to_lowercase()),
         ),
-        (Err(error), _) => {
+        Ok(Outcome::Undelivered(error)) => {
             let message = format!("{error} (tray → Copy last prompt)");
             overlay(app, "error", &message);
             notify(app, &message);
         }
     }
+    let _ = app.emit("history-changed", ());
     hide_overlay_later(app, 1600);
-    Ok(())
 }
 
-/// Inserts into the focused app, falling back to the clipboard. Returns what happened.
-/// Text is inserted only into the window that was active at key press; we never move focus
-/// back, so a changed window gets the clipboard instead.
-async fn deliver(
-    app: &AppHandle,
-    settings: &Settings,
-    text: &str,
-    target: Option<&target::Window>,
-    latency: &mut Latency,
-) -> Result<String> {
-    let copy = |latency: &mut Latency, reason: &str| -> Result<()> {
-        let started = Instant::now();
-        let result = insertion::copy_to_clipboard(text);
-        latency.clipboard_ms += ms(started);
-        latency.delivery = format!("copied_{reason}");
-        result
-    };
-    let configured = insertion::Method::parse(&settings.insertion_method);
-    if !settings.auto_insert || configured == insertion::Method::Clipboard {
-        copy(latency, "setting")?;
-        return Ok("Copied — press Ctrl+V".into());
-    }
-    // Typing while the user still holds a modifier would turn letters into shortcuts.
-    let waiting = Instant::now();
-    let held = wait_for_keys_released(app, Duration::from_secs(3)).await;
-    latency.held_wait_ms = ms(waiting);
-    if held {
-        log::warn!("keys still held after 3 s; copying instead of typing");
-        copy(latency, "held_keys")?;
-        return Ok("Keys still held — copied, press Ctrl+V".into());
-    }
-    // Revalidate last, after every wait, right before keys are sent.
-    let state = app.state::<AppState>();
-    let now = state.windows.as_ref().map(target::Tracker::active);
-    let destination = match &now {
-        Some(now) => target::revalidate(target, now.as_ref()),
-        None => target::Destination::Unknown,
-    };
-    latency.destination = destination.label();
-    log::info!(
-        "destination {} app={}",
-        destination.label(),
-        target.map_or("none", |w| w.app_id.as_str())
-    );
-    let window = match destination {
-        target::Destination::Confirmed(window) => Some(window),
-        target::Destination::Changed { from, to } => {
-            log::info!(
-                "target changed from {} to {}; copying instead of inserting",
-                from.app_id,
-                to.map_or("none".into(), |w| w.app_id)
-            );
-            copy(latency, "target_changed")?;
-            return Ok("Window changed — copied, press Ctrl+V".into());
-        }
-        // Tracking works but no window was active at press: nothing to insert into.
-        target::Destination::Unknown if now.is_some() => {
-            copy(latency, "no_target")?;
-            return Ok("No target window — copied, press Ctrl+V".into());
-        }
-        // No tracking on this compositor: keep the configured behavior.
-        target::Destination::Unknown => None,
-    };
-    let method = insertion::choose(configured, window.as_ref(), text);
-    let text_owned = text.to_string();
-    let result =
-        tauri::async_runtime::spawn_blocking(move || insertion::insert(method, &text_owned))
-            .await?;
-    match result {
-        Ok(timing) => {
-            latency.insert_setup_ms = timing.setup_ms;
-            latency.insert_keys_ms = timing.keys_ms;
-            latency.clipboard_ms = timing.clipboard_ms;
-            latency.delivery = method.name().into();
-            if settings.keep_in_clipboard && method == insertion::Method::Type {
-                // The text is already inserted; a clipboard failure here is not a delivery failure.
-                let started = Instant::now();
-                if let Err(error) = insertion::copy_to_clipboard(text) {
-                    log::warn!("keep-in-clipboard failed: {error:#}");
-                }
-                latency.clipboard_ms += ms(started);
-            }
-            Ok("Inserted".into())
-        }
-        Err(error) => {
-            log::warn!("insertion failed, copying instead: {error:#}");
-            copy(latency, "insert_failed")?;
-            Ok("Copied — press Ctrl+V".into())
-        }
-    }
-}
-
-/// Polls physical key state for up to `limit`; returns true if keys are still held.
-async fn wait_for_keys_released(app: &AppHandle, limit: Duration) -> bool {
-    let state = app.state::<AppState>();
-    let deadline = Instant::now() + limit;
-    loop {
-        let held = state
-            .hotkey
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|h| h.keys_held());
-        if !held || Instant::now() >= deadline {
-            return held;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+/// The app's providers, built per dictation from the stored key.
+fn connect(client: reqwest::Client) -> voice_prompt::pipeline::Connect {
+    Box::new(move |settings| {
+        let key = settings::secret::get()?
+            .ok_or_else(|| anyhow!("No 9Router API key. Open Voice Prompt settings → Speech."))?;
+        Ok(providers::connect(client.clone(), settings, key))
+    })
 }
 
 // ---------- commands ----------
@@ -921,17 +403,35 @@ async fn test_connection(state: tauri::State<'_, AppState>) -> CommandResult<Str
 
 #[tauri::command]
 fn history_list(state: tauri::State<AppState>) -> CommandResult<Vec<Entry>> {
-    state.history.lock().unwrap().list(500).map_err(text_error)
+    state
+        .pipeline
+        .history
+        .lock()
+        .unwrap()
+        .list(500)
+        .map_err(text_error)
 }
 
 #[tauri::command]
 fn history_delete(state: tauri::State<AppState>, id: i64) -> CommandResult<()> {
-    state.history.lock().unwrap().delete(id).map_err(text_error)
+    state
+        .pipeline
+        .history
+        .lock()
+        .unwrap()
+        .delete(id)
+        .map_err(text_error)
 }
 
 #[tauri::command]
 fn history_clear(state: tauri::State<AppState>) -> CommandResult<()> {
-    state.history.lock().unwrap().clear().map_err(text_error)
+    state
+        .pipeline
+        .history
+        .lock()
+        .unwrap()
+        .clear()
+        .map_err(text_error)
 }
 
 #[tauri::command]
@@ -998,7 +498,7 @@ async fn diagnostics(state: tauri::State<'_, AppState>) -> CommandResult<Diagnos
         keyring,
         log_file: logger::path().display().to_string(),
         memory_mb,
-        latency: state.latency.lock().unwrap().clone(),
+        latency: state.pipeline.last_latency.lock().unwrap().clone(),
     })
 }
 
@@ -1008,36 +508,27 @@ fn retry_last(app: &AppHandle) {
         notify(app, "A dictation is still being processed.");
         return;
     };
-    let Some(samples) = state.failed_audio.lock().unwrap().take() else {
+    let Some(samples) = state.pipeline.take_failed_audio() else {
         notify(app, "Nothing to retry.");
         return;
     };
+    // A retry has no press-time window, so delivery falls back to the clipboard.
+    let snapshot = Snapshot::take(state.settings.lock().unwrap().clone(), None);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        // A retry has no press-time window, so delivery falls back to the clipboard.
-        let settings = app.state::<AppState>().settings.lock().unwrap().clone();
-        let (vocabulary, technical) = context_vocabulary(&settings, None);
-        let dictation = Dictation {
-            pressed: None,
-            released: Instant::now(),
-            held: Duration::MAX,
-            target: None,
-            stream: None,
-            vocabulary,
-            technical,
-        };
-        let result = process(&app, samples, Latency::default(), dictation).await;
+        process(&app, &snapshot, Recording::retry(samples)).await;
         drop(busy);
-        if let Err(error) = result {
-            overlay(&app, "error", format!("{error}"));
-            notify(&app, &format!("{error}"));
-            hide_overlay_later(&app, 4000);
-        }
     });
 }
 
 fn copy_last_prompt(app: &AppHandle) {
-    let prompt = app.state::<AppState>().last_prompt.lock().unwrap().clone();
+    let prompt = app
+        .state::<AppState>()
+        .pipeline
+        .last_prompt
+        .lock()
+        .unwrap()
+        .clone();
     match prompt.map(|text| insertion::copy_to_clipboard(&text)) {
         None => notify(app, "No prompt yet."),
         Some(Ok(())) => notify(app, "Last prompt copied — press Ctrl+V."),
@@ -1156,26 +647,34 @@ fn main() {
     if let Err(error) = settings::apply_autostart(settings.autostart) {
         log::warn!("autostart: {error:#}");
     }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+        .expect("http client");
+    let windows = target::Tracker::start()
+        .map_err(|error| log::info!("window tracking unavailable: {error:#}"))
+        .ok();
+    let hotkey: Arc<Mutex<Option<HotkeyManager>>> = Default::default();
+    let held = hotkey.clone();
+    let desktop = delivery::System {
+        windows: windows.clone(),
+        keys_held: Box::new(move || {
+            held.lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(HotkeyManager::keys_held)
+        }),
+    };
     let state = AppState {
         settings: Mutex::new(settings),
-        history: Mutex::new(history),
-        hotkey: Mutex::new(None),
+        pipeline: Pipeline::new(history, connect(client.clone()), Arc::new(desktop)),
+        hotkey,
         hotkey_error: Mutex::new(None),
         recording: Mutex::new(None),
-        failed_audio: Mutex::new(None),
-        last_prompt: Mutex::new(None),
         busy: Arc::new(AtomicBool::new(false)),
-        latency: Mutex::new(None),
-        started: Instant::now(),
-        last_request: Mutex::new(None),
-        client: reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .expect("http client"),
-        windows: target::Tracker::start()
-            .map_err(|error| log::info!("window tracking unavailable: {error:#}"))
-            .ok(),
+        client,
+        windows,
     };
 
     tauri::Builder::default()
@@ -1226,29 +725,6 @@ mod tests {
         );
         drop(first);
         assert!(Busy::acquire(&flag).is_some());
-    }
-
-    #[test]
-    fn stt_vocabulary_is_contextual_but_cleanup_keeps_the_list() {
-        let settings = Settings::default();
-        let window = |app_id: &str, title: &str| target::Window {
-            id: "1".into(),
-            app_id: app_id.into(),
-            title: title.into(),
-        };
-        let (terms, technical) =
-            context_vocabulary(&settings, Some(&window("code", "main.rs - wispr")));
-        assert!(technical);
-        assert_eq!(terms[0], "main.rs");
-        assert!(terms.contains(&"9Router".to_string()));
-        let (terms, technical) =
-            context_vocabulary(&settings, Some(&window("signal", "Shopping list")));
-        assert!(!technical, "prose gets no STT keyterms");
-        assert_eq!(
-            terms, settings.vocabulary,
-            "cleanup still filters the global list"
-        );
-        assert!(settings::relevant_terms(&terms, "buy milk and eggs").is_empty());
     }
 
     #[test]

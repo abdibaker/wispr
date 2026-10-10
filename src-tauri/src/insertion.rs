@@ -17,10 +17,10 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Serialized as the `insertion_method` setting; unknown values type, as before.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Method {
-    /// Type the text with a virtual keyboard.
-    Type,
     /// Put text on the clipboard and press Ctrl+V.
     Paste,
     /// Put text on the clipboard and press Ctrl+Shift+V (terminals).
@@ -29,17 +29,14 @@ pub enum Method {
     Clipboard,
     /// Paste with the shortcut the confirmed window takes; type into unknown or unverified apps.
     Auto,
+    /// Type the text with a virtual keyboard.
+    #[serde(other)]
+    Type,
 }
 
 impl Method {
     pub fn parse(name: &str) -> Self {
-        match name {
-            "paste" => Self::Paste,
-            "paste-terminal" => Self::PasteTerminal,
-            "clipboard" => Self::Clipboard,
-            "auto" => Self::Auto,
-            _ => Self::Type,
-        }
+        serde_json::from_value(name.into()).unwrap_or(Self::Type)
     }
 
     pub fn name(self) -> &'static str {

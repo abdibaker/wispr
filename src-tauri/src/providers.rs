@@ -1,4 +1,5 @@
 //! SpeechProvider and PromptCleaner over OpenAI-compatible HTTP (9Router).
+use crate::settings::Settings;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -96,6 +97,36 @@ pub trait SpeechProvider: Send + Sync {
 #[async_trait]
 pub trait PromptCleaner: Send + Sync {
     async fn clean(&self, raw: &str, vocabulary: &[String], extra: &str) -> Result<Cleaned>;
+}
+
+/// Batch STT and cleanup, injected into the pipeline.
+pub struct Providers {
+    pub stt: Box<dyn SpeechProvider>,
+    pub cleaner: Box<dyn PromptCleaner>,
+}
+
+/// The app's providers: both go through the 9Router endpoint with one key.
+pub fn connect(client: reqwest::Client, settings: &Settings, api_key: String) -> Providers {
+    let stt = OpenAiCompatible {
+        client,
+        base_url: settings.endpoint.clone(),
+        api_key,
+        model: settings.stt_model.clone(),
+        timeout: Duration::from_secs(settings.stt_timeout_secs),
+        reasoning_effort: String::new(),
+    };
+    let cleaner = OpenAiCompatible {
+        model: settings.cleanup_model.clone(),
+        timeout: Duration::from_secs(settings.cleanup_timeout_secs),
+        reasoning_effort: settings.reasoning_effort.clone(),
+        client: stt.client.clone(),
+        base_url: stt.base_url.clone(),
+        api_key: stt.api_key.clone(),
+    };
+    Providers {
+        stt: Box::new(stt),
+        cleaner: Box::new(cleaner),
+    }
 }
 
 pub struct OpenAiCompatible {

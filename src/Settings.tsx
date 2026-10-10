@@ -15,7 +15,7 @@ type SettingsData = {
   language: string;
   streaming: boolean;
   streaming_model: string;
-  streaming_provider: string;
+  streaming_provider: "deepgram" | "muse";
   cleanup_enabled: boolean;
   cleanup_model: string;
   reasoning_effort: string;
@@ -23,7 +23,7 @@ type SettingsData = {
   vocabulary: string[];
   history_enabled: boolean;
   history_retention_days: number;
-  insertion_method: string;
+  insertion_method: "auto" | "type" | "paste" | "paste-terminal" | "clipboard";
   debug_logging: boolean;
   stt_timeout_secs: number;
   cleanup_timeout_secs: number;
@@ -294,7 +294,7 @@ function Speech({ settings, update }: SectionProps) {
         <Toggle checked={settings.streaming} onChange={(streaming) => update({ streaming })} />
       </Row>
       <Row label="Live transcription provider">
-        <select value={settings.streaming_provider} onChange={(e) => update({ streaming_provider: e.target.value })}>
+        <select value={settings.streaming_provider} onChange={(e) => update({ streaming_provider: e.target.value as SettingsData["streaming_provider"] })}>
           <option value="deepgram">Deepgram Nova-3</option>
           <option value="muse">Meta Muse Voice Transcribe (experimental)</option>
         </select>
@@ -505,7 +505,7 @@ function Advanced({ settings, update }: SectionProps) {
         label="Insertion method"
         hint="Paste methods overwrite the clipboard. Text goes only to the window active when you pressed the shortcut; if it changed, the text is copied instead."
       >
-        <select value={settings.insertion_method} onChange={(e) => update({ insertion_method: e.target.value })}>
+        <select value={settings.insertion_method} onChange={(e) => update({ insertion_method: e.target.value as SettingsData["insertion_method"] })}>
           <option value="auto">Automatic (paste; Ctrl+Shift+V in terminals)</option>
           <option value="type">Type (virtual keyboard)</option>
           <option value="paste">Paste with Ctrl+V</option>

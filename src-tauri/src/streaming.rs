@@ -7,7 +7,10 @@
 //! - Meta Muse (experimental): the Meta key goes in the first JSON frame, not a header.
 //!   After `endStream`, a push-to-talk session ends with one `transcript` event marked
 //!   `final: true` and then a normal close (1000); anything else falls back to batch STT.
-use crate::{audio, settings::Settings};
+use crate::{
+    audio,
+    settings::{Settings, StreamingProvider},
+};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -38,6 +41,9 @@ pub const MUSE_MODEL: &str = "muse-voice-transcribe-1.0";
 const MUSE_MAX_LEAD: Duration = Duration::from_secs(3);
 /// Nova-3 accepts up to 100 keyterms within 500 tokens; identifiers tokenize densely.
 const MAX_KEYTERMS: usize = 50;
+/// Deepgram's flush after CloseStream normally takes a few hundred ms; past this the
+/// session is untrusted and the retained recording goes to batch STT.
+const FINALIZE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Why streaming produced no trusted transcript; logged as `fallback_reason`.
 #[derive(Debug)]
@@ -62,7 +68,7 @@ fn fail(reason: &'static str, message: impl Into<String>) -> anyhow::Error {
     .into()
 }
 
-pub fn reason(error: &anyhow::Error) -> &'static str {
+fn reason(error: &anyhow::Error) -> &'static str {
     error
         .downcast_ref::<StreamError>()
         .map_or("error", |e| e.reason)
@@ -113,18 +119,58 @@ impl AudioSink {
 
 /// A running session. Dropping it cancels: the socket closes without finalizing.
 pub struct StreamSession {
-    /// `deepgram` | `muse`
-    pub provider: &'static str,
+    /// `streaming_deepgram` | `streaming_muse`
+    mode: &'static str,
+    /// Attribution for history, e.g. `deepgram/nova-3`.
+    model: String,
     task: tauri::async_runtime::JoinHandle<Result<String>>,
     stopped: Arc<AtomicBool>,
     overflowed: Arc<AtomicBool>,
-    pub stats: Arc<Mutex<Stats>>,
+    stats: Arc<Mutex<Stats>>,
+}
+
+/// A transcript the provider confirmed complete, with the model that produced it.
+#[derive(Debug, PartialEq)]
+pub struct Streamed {
+    pub text: String,
+    pub model: String,
+}
+
+/// How a session ended. Only `transcript: Ok` may be used; any `Err` names the
+/// `fallback_reason` and the caller replays the full recording to batch STT.
+#[derive(Debug)]
+pub struct Conclusion {
+    pub transcript: std::result::Result<Streamed, &'static str>,
+    /// `streaming_deepgram` | `streaming_muse`
+    pub mode: &'static str,
+    pub stats: Stats,
 }
 
 impl StreamSession {
+    /// Ends the audio-side wait and decides whether the transcript can be trusted. Call once
+    /// capture has stopped (the sink is dropped); only for audio the caller found not silent.
+    pub async fn conclude(self) -> Conclusion {
+        let stats = self.stats.clone();
+        let mode = self.mode;
+        let model = self.model.clone();
+        let transcript = match self.finish(FINALIZE_DEADLINE).await {
+            // Metadata arrived but nothing was finalized for audio that is not silent:
+            // let batch STT have a go rather than report "nothing recognised".
+            Ok(text) if text.is_empty() => Err("empty"),
+            Ok(text) => Ok(Streamed { text, model }),
+            Err(error) => Err(reason(&error)),
+        };
+        let stats = *stats.lock().unwrap();
+        Conclusion {
+            transcript,
+            mode,
+            stats,
+        }
+    }
+
     /// The complete transcript, once the provider confirms the session finished. Call after the
     /// sink is dropped; fails at `deadline` rather than returning partial text.
-    pub async fn finish(mut self, deadline: Duration) -> Result<String> {
+    async fn finish(mut self, deadline: Duration) -> Result<String> {
         if self.overflowed.load(Ordering::SeqCst) {
             return Err(fail("queue_overflow", "Streaming queue overflowed"));
         }
@@ -146,9 +192,18 @@ impl Drop for StreamSession {
     }
 }
 
-/// Starts a session whose audio is queued until the provider connection is ready.
-pub trait StreamingTranscriber {
-    fn start(&self, keyterms: &[String]) -> (StreamSession, AudioSink);
+/// Starts the configured provider's session; audio is queued until its connection is ready.
+pub fn start(
+    client: reqwest::Client,
+    settings: &Settings,
+    keyterms: &[String],
+) -> (StreamSession, AudioSink) {
+    match settings.streaming_provider {
+        StreamingProvider::Muse => MuseStreamingTranscriber::new(settings).start(keyterms),
+        StreamingProvider::Deepgram => {
+            DeepgramStreamingTranscriber::new(client, settings).start(keyterms)
+        }
+    }
 }
 
 pub struct DeepgramStreamingTranscriber {
@@ -168,14 +223,22 @@ impl DeepgramStreamingTranscriber {
             language: settings.language.clone(),
         }
     }
-}
 
-impl StreamingTranscriber for DeepgramStreamingTranscriber {
-    fn start(&self, keyterms: &[String]) -> (StreamSession, AudioSink) {
+    pub fn start(&self, keyterms: &[String]) -> (StreamSession, AudioSink) {
         let url = listen_url(LISTEN_URL, &self.model, &self.language, keyterms);
         let token = Box::pin(token(self.client.clone(), self.endpoint.clone()));
-        spawn("deepgram", move |audio| deepgram(token, url, audio))
+        spawn(deepgram_label(&self.model), move |audio| {
+            deepgram(token, url, audio)
+        })
     }
+}
+
+fn deepgram_label(model: &str) -> (&'static str, String) {
+    ("streaming_deepgram", format!("deepgram/{model}"))
+}
+
+fn muse_label() -> (&'static str, String) {
+    ("streaming_muse", format!("meta/{MUSE_MODEL}"))
 }
 
 pub struct MuseStreamingTranscriber {
@@ -191,10 +254,8 @@ impl MuseStreamingTranscriber {
             language_bias: true,
         }
     }
-}
 
-impl StreamingTranscriber for MuseStreamingTranscriber {
-    fn start(&self, keyterms: &[String]) -> (StreamSession, AudioSink) {
+    pub fn start(&self, keyterms: &[String]) -> (StreamSession, AudioSink) {
         let language = self.language_bias.then_some(self.language.as_str());
         let config = muse_config(language, keyterms);
         let key: TokenFuture = Box::pin(async {
@@ -205,7 +266,7 @@ impl StreamingTranscriber for MuseStreamingTranscriber {
             .map_err(|_| fail("auth", "Keyring read stopped"))??
             .ok_or_else(|| fail("auth", "No Meta Muse API key. Open Settings → Speech."))
         });
-        spawn("muse", move |audio| {
+        spawn(muse_label(), move |audio| {
             muse(key, MUSE_URL.into(), config, audio)
         })
     }
@@ -230,7 +291,7 @@ impl Audio {
 }
 
 /// Creates the queue first, then starts credential and connection work behind it.
-fn spawn<F, Fut>(provider: &'static str, run: F) -> (StreamSession, AudioSink)
+fn spawn<F, Fut>((mode, model): (&'static str, String), run: F) -> (StreamSession, AudioSink)
 where
     F: FnOnce(Audio) -> Fut,
     Fut: Future<Output = Result<String>> + Send + 'static,
@@ -247,7 +308,8 @@ where
     }));
     (
         StreamSession {
-            provider,
+            mode,
+            model,
             task,
             stopped: stopped.clone(),
             overflowed: overflowed.clone(),
@@ -714,6 +776,17 @@ pub async fn muse_check() -> Result<()> {
     }
 }
 
+/// A session that already ended with `result`, for tests of callers.
+#[cfg(test)]
+pub fn ended(result: std::result::Result<&'static str, &'static str>) -> StreamSession {
+    let (session, _sink) = spawn(deepgram_label("nova-3"), move |_audio| async move {
+        result
+            .map(String::from)
+            .map_err(|reason| fail(reason, reason))
+    });
+    session
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,7 +819,9 @@ mod tests {
     }
 
     fn dg(token: TokenFuture, url: String) -> (StreamSession, AudioSink) {
-        spawn("deepgram", move |audio| deepgram(token, url, audio))
+        spawn(deepgram_label("nova-3"), move |audio| {
+            deepgram(token, url, audio)
+        })
     }
 
     fn chunk(value: i16) -> Vec<i16> {
@@ -1092,7 +1167,7 @@ mod tests {
         keyterms: &[String],
     ) -> (StreamSession, AudioSink) {
         let config = muse_config(Some("en"), keyterms);
-        spawn("muse", move |audio| muse(key, url, config, audio))
+        spawn(muse_label(), move |audio| muse(key, url, config, audio))
     }
 
     fn muse_transcript(text: &str, is_final: bool) -> Message {

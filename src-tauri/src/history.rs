@@ -18,6 +18,14 @@ pub struct Entry {
     pub latency_ms: i64,
 }
 
+/// Wall-clock time in ms, as stored in `created_at`.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 pub struct HistoryStore {
     connection: Connection,
 }

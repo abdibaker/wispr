@@ -2,21 +2,26 @@
 //! `echo hi | cargo run --example inserttest -- type|paste|paste-terminal|auto [--revalidate MS]`
 //! `--revalidate MS` snapshots the active window, waits MS, then delivers like the app: insert
 //! only if the same window is still active, otherwise copy.
-#[path = "../src/insertion.rs"]
-#[allow(dead_code)]
-mod insertion;
-#[path = "../src/target.rs"]
-#[allow(dead_code)]
-mod target;
 use std::io::Read;
+use std::sync::Arc;
+use voice_prompt::{delivery, insertion, settings::Settings, target};
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let configured = insertion::Method::parse(args.get(1).map_or("", String::as_str));
+    let settings = Settings {
+        insertion_method: insertion::Method::parse(args.get(1).map_or("", String::as_str)),
+        keep_in_clipboard: false,
+        ..Default::default()
+    };
     let mut text = String::new();
     std::io::stdin().read_to_string(&mut text)?;
-    let tracker = target::Tracker::start().ok();
-    let pressed = tracker.as_ref().and_then(target::Tracker::active);
+    let desktop = delivery::System {
+        windows: target::Tracker::start().ok(),
+        // No hotkey here: the caller is not holding the shortcut.
+        keys_held: Box::new(|| false),
+    };
+    let pressed = desktop.windows.as_ref().and_then(target::Tracker::active);
     if let Some(wait) = args
         .iter()
         .position(|a| a == "--revalidate")
@@ -25,29 +30,21 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(wait.parse()?));
     }
     let started = std::time::Instant::now();
-    let now = tracker.as_ref().map(target::Tracker::active);
-    let destination = match &now {
-        Some(now) => target::revalidate(pressed.as_ref(), now.as_ref()),
-        None => target::Destination::Unknown,
-    };
-    let window = match &destination {
-        target::Destination::Confirmed(window) => Some(window.clone()),
-        _ => None,
-    };
-    let method = match destination {
-        target::Destination::Changed { .. } => insertion::Method::Clipboard,
-        target::Destination::Unknown if now.is_some() => insertion::Method::Clipboard,
-        _ => insertion::choose(configured, window.as_ref(), &text),
-    };
-    let timing = insertion::insert(method, &text)?;
+    let delivered =
+        delivery::deliver(Arc::new(desktop), &settings, &text, pressed.as_ref()).await?;
+    let method = delivered
+        .delivery
+        .strip_prefix("copied_")
+        .map_or(delivered.delivery.as_str(), |_| "copied");
     println!(
-        "{{\"method\":\"{}\",\"destination\":\"{}\",\"app\":\"{}\",\"setup_ms\":{},\"keys_ms\":{},\"clipboard_ms\":{},\"total_ms\":{}}}",
-        method.name(),
-        destination.label(),
-        window.map_or(String::new(), |w| w.app_id),
-        timing.setup_ms,
-        timing.keys_ms,
-        timing.clipboard_ms,
+        "{{\"method\":\"{}\",\"delivery\":\"{}\",\"destination\":\"{}\",\"app\":\"{}\",\"setup_ms\":{},\"keys_ms\":{},\"clipboard_ms\":{},\"total_ms\":{}}}",
+        method,
+        delivered.delivery,
+        if delivered.destination.is_empty() { "unknown" } else { delivered.destination },
+        pressed.map_or(String::new(), |w| w.app_id),
+        delivered.insert.setup_ms,
+        delivered.insert.keys_ms,
+        delivered.insert.clipboard_ms,
         started.elapsed().as_millis()
     );
     // The clipboard is served from this process (as in the app); stay alive so the target can read it.

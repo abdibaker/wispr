@@ -1,4 +1,5 @@
 //! SettingsStore, SecretStore and VocabularyService.
+use crate::insertion::Method;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -24,8 +25,7 @@ pub struct Settings {
     /// Stream audio to Deepgram while the key is held; batch STT stays the fallback.
     pub streaming: bool,
     pub streaming_model: String,
-    /// deepgram | muse (experimental)
-    pub streaming_provider: String,
+    pub streaming_provider: StreamingProvider,
     // Cleanup
     pub cleanup_enabled: bool,
     pub cleanup_model: String,
@@ -37,12 +37,21 @@ pub struct Settings {
     pub history_enabled: bool,
     pub history_retention_days: u32,
     // Advanced
-    pub insertion_method: String,
+    pub insertion_method: Method,
     pub debug_logging: bool,
     pub stt_timeout_secs: u64,
     pub cleanup_timeout_secs: u64,
     pub min_hold_ms: u64,
     pub max_record_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamingProvider {
+    Muse,
+    /// Also any unknown value, as before typed settings.
+    #[serde(other)]
+    Deepgram,
 }
 
 impl Default for Settings {
@@ -61,7 +70,7 @@ impl Default for Settings {
             language: "en".into(),
             streaming: true,
             streaming_model: "nova-3".into(),
-            streaming_provider: "deepgram".into(),
+            streaming_provider: StreamingProvider::Deepgram,
             cleanup_enabled: true,
             // Fastest model passing the full cleanup corpus (bench/results, 2026-10-09).
             cleanup_model: "claude-haiku-5-5".into(),
@@ -82,7 +91,7 @@ impl Default for Settings {
             .to_vec(),
             history_enabled: true,
             history_retention_days: 30,
-            insertion_method: "type".into(),
+            insertion_method: Method::Type,
             debug_logging: false,
             stt_timeout_secs: 30,
             cleanup_timeout_secs: 15,
@@ -362,6 +371,34 @@ mod tests {
         let settings = load(dir.path());
         assert_eq!(settings.language, "de");
         assert_eq!(settings.shortcut, "Ctrl+Super");
+    }
+
+    #[test]
+    fn choices_read_old_files_and_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+        fs::write(
+            &file,
+            r#"{"streaming_provider":"muse","insertion_method":"paste-terminal"}"#,
+        )
+        .unwrap();
+        let settings = load(dir.path());
+        assert_eq!(settings.streaming_provider, StreamingProvider::Muse);
+        assert_eq!(settings.insertion_method, Method::PasteTerminal);
+        // Unknown values fall back per field, as the string settings did, not to all defaults.
+        fs::write(
+            &file,
+            r#"{"language":"de","streaming_provider":"other","insertion_method":"bogus"}"#,
+        )
+        .unwrap();
+        let settings = load(dir.path());
+        assert_eq!(settings.language, "de");
+        assert_eq!(settings.streaming_provider, StreamingProvider::Deepgram);
+        assert_eq!(settings.insertion_method, Method::Type);
+        save(dir.path(), &settings).unwrap();
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(saved.contains(r#""streaming_provider": "deepgram""#));
+        assert!(saved.contains(r#""insertion_method": "type""#));
     }
 
     #[test]

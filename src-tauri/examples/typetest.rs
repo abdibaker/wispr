@@ -1,10 +1,5 @@
 //! Types a fixed string into the focused window: `cargo run --example typetest`
-#[path = "../src/insertion.rs"]
-#[allow(dead_code)]
-mod insertion;
-#[path = "../src/target.rs"]
-#[allow(dead_code)]
-mod target;
+use voice_prompt::insertion;
 
 fn main() -> anyhow::Result<()> {
     insertion::insert(

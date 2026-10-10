@@ -1,10 +1,8 @@
 //! Test helper: holds a chord on a virtual uinput keyboard.
 //! `cargo run --example ptt -- 4000` holds Ctrl+Super for 4 s; `setkey` stores $VP_KEY in the keyring.
-#[path = "../src/settings.rs"]
-#[allow(dead_code)]
-mod settings;
 use evdev::{uinput::VirtualDevice, AttributeSet, EventType, InputEvent, KeyCode};
 use std::time::Duration;
+use voice_prompt::settings;
 
 fn main() -> anyhow::Result<()> {
     let arg = std::env::args().nth(1).unwrap_or_else(|| "3000".into());

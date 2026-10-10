@@ -1,7 +1,5 @@
 //! Prints the active window as COSMIC reports it: `cargo run --example activewindow [seconds]`.
-#[path = "../src/target.rs"]
-#[allow(dead_code)]
-mod target;
+use voice_prompt::target;
 
 fn main() -> anyhow::Result<()> {
     let tracker = target::Tracker::start()?;
