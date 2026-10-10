@@ -1,149 +1,274 @@
-use crate::{audio, providers::Transcript, settings::Settings};
-use anyhow::{anyhow, bail, Context, Result};
+//! Live transcription: PCM streams from the capture thread straight to Deepgram while the
+//! key is held. 9Router only mints the short-lived token; audio never passes through it.
+//!
+//! Completion needs positive evidence: after `CloseStream`, Deepgram flushes the remaining
+//! results, sends `Metadata`, then closes. `is_final`, `speech_final`, silence or a bare close
+//! never complete a session, so a missing `Metadata` falls back to batch STT.
+use crate::{audio, settings::Settings};
+use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::Request, Message};
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    http::{HeaderValue, StatusCode},
+    Message,
+};
 
-const QUEUE_BLOCKS: usize = 100;
+/// Audio held while the token and socket are set up: 10 s of 16 kHz PCM16. Past it the
+/// session fails and the batch fallback transcribes the retained recording instead.
+pub const MAX_QUEUED_BYTES: usize = 10 * audio::RATE as usize * 2;
+/// Deepgram closes a socket after 10 s without audio or KeepAlive.
+const KEEP_ALIVE: Duration = Duration::from_secs(4);
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const LISTEN_URL: &str = "wss://api.deepgram.com/v1/listen";
+/// Nova-3 accepts up to 100 keyterms within 500 tokens; identifiers tokenize densely.
+const MAX_KEYTERMS: usize = 50;
 
-pub struct Input {
-    sender: mpsc::Sender<Vec<u8>>,
-    failed: Arc<AtomicBool>,
-    min_hold: Duration,
-    speech: bool,
-    checked_samples: usize,
-    sent_samples: usize,
+/// Why streaming produced no trusted transcript; logged as `fallback_reason`.
+#[derive(Debug)]
+pub struct StreamError {
+    pub reason: &'static str,
+    message: String,
 }
 
-impl Input {
-    pub fn push(&mut self, samples: &[i16], held: Duration) {
-        if self.failed.load(Ordering::SeqCst) {
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StreamError {}
+
+fn fail(reason: &'static str, message: impl Into<String>) -> anyhow::Error {
+    StreamError {
+        reason,
+        message: message.into(),
+    }
+    .into()
+}
+
+pub fn reason(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<StreamError>()
+        .map_or("error", |e| e.reason)
+}
+
+/// When each stage of a session happened; `None` until it does.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    pub token: Option<Instant>,
+    pub connected: Option<Instant>,
+    pub first_sent: Option<Instant>,
+    pub last_sent: Option<Instant>,
+    pub finalize_sent: Option<Instant>,
+    pub first_partial: Option<Instant>,
+    pub first_final: Option<Instant>,
+}
+
+/// The capture side of a session. Pushing never blocks the audio thread; dropping it ends
+/// the audio, which flushes the queue and finalizes.
+pub struct AudioSink {
+    sender: mpsc::UnboundedSender<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+    stopped: Arc<AtomicBool>,
+    overflowed: Arc<AtomicBool>,
+}
+
+impl AudioSink {
+    /// Queues one capture chunk (800 samples). The byte bound, not the message count,
+    /// limits memory. On overflow the session stops: audio is never dropped from the middle.
+    pub fn push(&self, samples: &[i16]) {
+        if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        self.speech |= !audio::is_silent(&samples[self.checked_samples..]);
-        self.checked_samples = samples.len();
-        if held < self.min_hold || !self.speech {
-            return;
-        }
-        let bytes = samples[self.sent_samples..]
-            .iter()
-            .flat_map(|sample| sample.to_le_bytes())
-            .collect();
-        if self.sender.try_send(bytes).is_err() {
-            self.failed.store(true, Ordering::SeqCst);
-        } else {
-            self.sent_samples = samples.len();
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let queued = self.queued.fetch_add(bytes.len(), Ordering::SeqCst) + bytes.len();
+        if queued > MAX_QUEUED_BYTES {
+            self.overflowed.store(true, Ordering::SeqCst);
+            self.stopped.store(true, Ordering::SeqCst);
+        } else if self.sender.send(bytes).is_err() {
+            // The task already ended; `finish` reports why.
+            self.stopped.store(true, Ordering::SeqCst);
         }
     }
 }
 
-pub struct Session {
-    task: tauri::async_runtime::JoinHandle<Result<Transcript>>,
-    timeout: Duration,
-    failed: Arc<AtomicBool>,
+/// A running session. Dropping it cancels: the socket closes without finalizing.
+pub struct StreamSession {
+    task: tauri::async_runtime::JoinHandle<Result<String>>,
+    stopped: Arc<AtomicBool>,
+    overflowed: Arc<AtomicBool>,
+    pub stats: Arc<Mutex<Stats>>,
 }
 
-impl Session {
-    pub fn start(settings: &Settings) -> (Self, Input) {
-        let (sender, receiver) = mpsc::channel(QUEUE_BLOCKS);
-        let failed = Arc::new(AtomicBool::new(false));
-        let settings = settings.clone();
-        let timeout = Duration::from_secs(settings.stt_timeout_secs);
-        let min_hold = Duration::from_millis(settings.min_hold_ms);
-        let task_failed = failed.clone();
-        let task = tauri::async_runtime::spawn(async move {
-            let key = tauri::async_runtime::spawn_blocking(|| {
-                crate::settings::secret::get_for("deepgram")
-            })
-            .await??
-            .ok_or_else(|| anyhow!("No Deepgram API key. Open Settings → Speech."))?;
-            let request = request(&settings, &key)?;
-            transcribe(request, receiver, task_failed, timeout).await
-        });
-        (
-            Self {
-                task,
-                timeout,
-                failed: failed.clone(),
-            },
-            Input {
-                sender,
-                failed,
-                min_hold,
-                speech: false,
-                checked_samples: 0,
-                sent_samples: 0,
-            },
-        )
-    }
-
-    pub async fn finish(mut self) -> Result<Transcript> {
-        tokio::time::timeout(self.timeout, &mut self.task)
-            .await
-            .map_err(|_| anyhow!("Deepgram finalization timed out. The recording can be retried."))?
-            .context("Deepgram session stopped")?
-    }
-
-    pub async fn replay(settings: &Settings, samples: &[i16]) -> Result<Transcript> {
-        let (session, mut input) = Self::start(settings);
-        input.push(samples, Duration::from_millis(settings.min_hold_ms));
-        drop(input);
-        session.finish().await
+impl StreamSession {
+    /// The complete transcript, once Deepgram confirms the session finished. Call after the
+    /// sink is dropped; fails at `deadline` rather than returning partial text.
+    pub async fn finish(mut self, deadline: Duration) -> Result<String> {
+        if self.overflowed.load(Ordering::SeqCst) {
+            return Err(fail("queue_overflow", "Streaming queue overflowed"));
+        }
+        match tokio::time::timeout(deadline, &mut self.task).await {
+            Err(_) => Err(fail("finalize_timeout", "Deepgram did not finish in time")),
+            Ok(Err(_)) => Err(fail("task", "Streaming task stopped")),
+            Ok(Ok(result)) => result,
+        }
     }
 }
 
-impl Drop for Session {
+impl Drop for StreamSession {
     fn drop(&mut self) {
-        self.failed.store(true, Ordering::SeqCst);
+        self.stopped.store(true, Ordering::SeqCst);
         self.task.abort();
     }
 }
 
-fn request(settings: &Settings, key: &str) -> Result<Request<()>> {
-    let mut url = reqwest::Url::parse("wss://api.deepgram.com/v1/listen")?;
+/// Starts a session whose audio is queued until the provider connection is ready.
+pub trait StreamingTranscriber {
+    fn start(&self, keyterms: &[String]) -> (StreamSession, AudioSink);
+}
+
+pub struct DeepgramStreamingTranscriber {
+    pub client: reqwest::Client,
+    /// 9Router base URL, which mints the token.
+    pub endpoint: String,
+    pub model: String,
+    pub language: String,
+}
+
+impl DeepgramStreamingTranscriber {
+    pub fn new(client: reqwest::Client, settings: &Settings) -> Self {
+        Self {
+            client,
+            endpoint: settings.endpoint.clone(),
+            model: settings.streaming_model.clone(),
+            language: settings.language.clone(),
+        }
+    }
+}
+
+impl StreamingTranscriber for DeepgramStreamingTranscriber {
+    fn start(&self, keyterms: &[String]) -> (StreamSession, AudioSink) {
+        let url = listen_url(LISTEN_URL, &self.model, &self.language, keyterms);
+        let token = Box::pin(token(self.client.clone(), self.endpoint.clone()));
+        spawn(token, url)
+    }
+}
+
+type TokenFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
+
+/// Creates the queue first, then starts token and connection work behind it.
+fn spawn(token: TokenFuture, url: String) -> (StreamSession, AudioSink) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Mutex::new(Stats::default()));
+    let task =
+        tauri::async_runtime::spawn(run(token, url, receiver, queued.clone(), stats.clone()));
+    (
+        StreamSession {
+            task,
+            stopped: stopped.clone(),
+            overflowed: overflowed.clone(),
+            stats,
+        },
+        AudioSink {
+            sender,
+            queued,
+            stopped,
+            overflowed,
+        },
+    )
+}
+
+/// Exchanges the 9Router key for a short-lived Deepgram token. The permanent Deepgram key
+/// stays in 9Router.
+async fn token(client: reqwest::Client, endpoint: String) -> Result<String> {
+    let key = tauri::async_runtime::spawn_blocking(crate::settings::secret::get)
+        .await
+        .map_err(|_| fail("token", "Keyring read stopped"))??
+        .ok_or_else(|| fail("token", "No 9Router API key"))?;
+    let response = client
+        .post(format!("{}/realtime/token", endpoint.trim_end_matches('/')))
+        .bearer_auth(key)
+        .json(&serde_json::json!({ "provider": "deepgram" }))
+        .timeout(TOKEN_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| {
+            let kind = if e.is_timeout() {
+                "token_timeout"
+            } else {
+                "token"
+            };
+            fail(kind, "Cannot reach 9Router for a Deepgram token")
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+            "rate_limited"
+        } else {
+            "token"
+        };
+        return Err(fail(
+            kind,
+            format!("9Router refused a Deepgram token ({status})"),
+        ));
+    }
+    #[derive(Deserialize)]
+    struct Grant {
+        access_token: String,
+    }
+    let grant: Grant = response
+        .json()
+        .await
+        .map_err(|_| fail("token", "Invalid Deepgram token response"))?;
+    Ok(grant.access_token)
+}
+
+/// The listen URL. The token goes in a header, so the URL holds no secret.
+fn listen_url(base: &str, model: &str, language: &str, keyterms: &[String]) -> String {
+    let mut url = reqwest::Url::parse(base).expect("valid listen URL");
     {
         let mut query = url.query_pairs_mut();
         query
-            .append_pair("model", &settings.deepgram_model)
+            .append_pair("model", model)
             .append_pair("encoding", "linear16")
             .append_pair("sample_rate", &audio::RATE.to_string())
             .append_pair("channels", "1")
-            .append_pair("interim_results", "false")
-            .append_pair("smart_format", "true");
-        if !settings.language.is_empty() && settings.language != "auto" {
-            query.append_pair("language", &settings.language);
-        } else {
-            query.append_pair("language", "multi");
-        }
-        let hint = if settings.deepgram_model.starts_with("nova-3") {
-            "keyterm"
-        } else {
-            "keywords"
-        };
-        for term in &settings.vocabulary {
-            let term = term.trim();
-            if !term.is_empty() {
-                query.append_pair(hint, term);
-            }
+            .append_pair("interim_results", "true")
+            .append_pair("smart_format", "true")
+            .append_pair(
+                "language",
+                if language.is_empty() || language == "auto" {
+                    "multi"
+                } else {
+                    language
+                },
+            );
+        for term in crate::settings::vocabulary_terms(keyterms)
+            .into_iter()
+            .take(MAX_KEYTERMS)
+        {
+            query.append_pair("keyterm", term);
         }
     }
-    let mut request = url.as_str().into_client_request()?;
-    let mut authorization = format!("Token {key}")
-        .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
-        .map_err(|_| anyhow!("Invalid Deepgram API key"))?;
-    authorization.set_sensitive(true);
-    request.headers_mut().insert("Authorization", authorization);
-    Ok(request)
+    url.into()
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum Event {
     Results {
+        #[serde(default)]
         is_final: bool,
         channel: Channel,
     },
@@ -163,472 +288,500 @@ struct Alternative {
     transcript: String,
 }
 
-async fn transcribe(
-    request: Request<()>,
-    mut receiver: mpsc::Receiver<Vec<u8>>,
-    failed: Arc<AtomicBool>,
-    timeout: Duration,
-) -> Result<Transcript> {
-    let (socket, _) = tokio::time::timeout(
-        timeout.min(Duration::from_secs(5)),
-        tokio_tungstenite::connect_async(request),
-    )
-    .await
-    .map_err(|_| anyhow!("Deepgram connection timed out"))?
-    .map_err(|error| match error {
-        tokio_tungstenite::tungstenite::Error::Http(response) => {
-            anyhow!("Deepgram rejected the connection ({}). Check the key and model in Settings → Speech.", response.status())
+/// Finalized segments and the current provisional segment, which Deepgram may revise
+/// freely until it marks the segment final.
+#[derive(Default)]
+struct Transcript {
+    finals: Vec<String>,
+    interim: String,
+}
+
+impl Transcript {
+    fn apply(&mut self, text: &str, is_final: bool) {
+        let text = text.trim();
+        if is_final {
+            self.interim.clear();
+            if !text.is_empty() {
+                self.finals.push(text.to_string());
+            }
+        } else {
+            self.interim = text.to_string();
         }
-        _ => anyhow!("Cannot connect to Deepgram: {error}"),
-    })?;
+    }
+
+    /// The finalized text only: provisional words are never delivered.
+    fn text(&self) -> String {
+        self.finals.join(" ")
+    }
+}
+
+fn mark(stats: &Mutex<Stats>, field: fn(&mut Stats) -> &mut Option<Instant>) {
+    field(&mut stats.lock().unwrap()).get_or_insert_with(Instant::now);
+}
+
+async fn run(
+    token: TokenFuture,
+    url: String,
+    mut receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+    stats: Arc<Mutex<Stats>>,
+) -> Result<String> {
+    let token = token.await?;
+    mark(&stats, |s| &mut s.token);
+    let mut request = url
+        .into_client_request()
+        .map_err(|_| fail("connect", "Invalid Deepgram URL"))?;
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| fail("token", "Invalid Deepgram token"))?;
+    authorization.set_sensitive(true);
+    request.headers_mut().insert("Authorization", authorization);
+    let (socket, _) =
+        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+            .await
+            .map_err(|_| fail("connect_timeout", "Deepgram connection timed out"))?
+            .map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Http(response) => {
+                    let status = response.status();
+                    let kind = match status {
+                        StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "auth",
+                        _ => "connect",
+                    };
+                    fail(kind, format!("Deepgram rejected the connection ({status})"))
+                }
+                _ => fail("connect", "Cannot connect to Deepgram"),
+            })?;
+    mark(&stats, |s| &mut s.connected);
     let (mut writer, mut reader) = socket.split();
     let closing = AtomicBool::new(false);
     let send = async {
-        let mut keep_alive = tokio::time::interval(Duration::from_secs(4));
+        let mut keep_alive = tokio::time::interval(KEEP_ALIVE);
+        keep_alive.tick().await;
         loop {
             let message = tokio::select! {
-                block = receiver.recv() => match block {
-                    Some(bytes) => Message::Binary(bytes.into()),
-                    None => {
-                        if failed.load(Ordering::SeqCst) {
-                            bail!("Deepgram audio delivery failed. The recording can be retried.");
-                        }
-                        closing.store(true, Ordering::SeqCst);
-                        tokio::time::timeout(timeout, writer.send(Message::text(r#"{"type":"CloseStream"}"#)))
-                            .await
-                            .map_err(|_| anyhow!("Deepgram audio flush timed out"))??;
-                        return Ok::<(), anyhow::Error>(());
+                chunk = receiver.recv() => match chunk {
+                    Some(bytes) => {
+                        queued.fetch_sub(bytes.len(), Ordering::SeqCst);
+                        Message::Binary(bytes.into())
                     }
+                    None => break,
                 },
                 _ = keep_alive.tick() => Message::text(r#"{"type":"KeepAlive"}"#),
             };
-            if failed.load(Ordering::SeqCst) {
-                bail!("Deepgram audio delivery failed. The recording can be retried.");
-            }
-            tokio::time::timeout(timeout, writer.send(message))
+            let audio = message.is_binary();
+            writer
+                .send(message)
                 .await
-                .map_err(|_| anyhow!("Deepgram audio upload timed out"))??;
+                .map_err(|_| fail("disconnected", "Deepgram connection lost while sending"))?;
+            if audio {
+                mark(&stats, |s| &mut s.first_sent);
+                stats.lock().unwrap().last_sent = Some(Instant::now());
+            }
         }
+        closing.store(true, Ordering::SeqCst);
+        writer
+            .send(Message::text(r#"{"type":"CloseStream"}"#))
+            .await
+            .map_err(|_| fail("disconnected", "Deepgram connection lost while finalizing"))?;
+        mark(&stats, |s| &mut s.finalize_sent);
+        Ok::<(), anyhow::Error>(())
     };
     let receive = async {
-        let mut segments = Vec::new();
+        let mut transcript = Transcript::default();
         while let Some(message) = reader.next().await {
-            match message? {
-                Message::Text(text) => {
-                    let event: Event = serde_json::from_str(&text)
-                        .map_err(|_| anyhow!("Invalid Deepgram transcription response"))?;
-                    match event {
-                        Event::Results {
-                            is_final: true,
-                            channel,
-                        } => {
-                            let alternative =
-                                channel.alternatives.into_iter().next().ok_or_else(|| {
-                                    anyhow!("Deepgram returned no transcript alternative")
-                                })?;
-                            let text = alternative.transcript.trim().to_string();
-                            if !text.is_empty() {
-                                segments.push(text);
+            let message = message.map_err(|_| fail("disconnected", "Deepgram connection lost"))?;
+            match message {
+                Message::Text(text) => match serde_json::from_str(&text)
+                    .map_err(|_| fail("protocol", "Invalid Deepgram message"))?
+                {
+                    Event::Results { is_final, channel } => {
+                        let text = channel
+                            .alternatives
+                            .first()
+                            .map_or("", |a| a.transcript.as_str());
+                        if !text.trim().is_empty() {
+                            mark(&stats, |s| &mut s.first_partial);
+                            if is_final {
+                                mark(&stats, |s| &mut s.first_final);
                             }
                         }
-                        Event::Metadata {} if closing.load(Ordering::SeqCst) => {
-                            return Ok(Transcript {
-                                text: segments.join(" "),
-                            });
-                        }
-                        Event::Error {} => bail!("Deepgram reported a streaming error"),
-                        _ => {}
+                        transcript.apply(text, is_final);
                     }
-                }
-                Message::Close(_) => bail!("Deepgram disconnected before transcription completed"),
-                Message::Binary(_) => bail!("Unexpected binary response from Deepgram"),
+                    Event::Metadata {} if closing.load(Ordering::SeqCst) => {
+                        return Ok(transcript.text());
+                    }
+                    Event::Error {} => {
+                        return Err(fail("provider_error", "Deepgram reported an error"))
+                    }
+                    _ => {}
+                },
+                Message::Close(_) => break,
                 _ => {}
             }
         }
-        bail!("Deepgram disconnected without completing transcription")
+        Err(fail(
+            "disconnected",
+            "Deepgram closed before the transcript was complete",
+        ))
     };
-    let (_, transcript) = tokio::try_join!(send, receive)?;
-    Ok(transcript)
+    let ((), text) = tokio::try_join!(send, receive)?;
+    Ok(text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
-    fn input_channel(capacity: usize) -> (Input, mpsc::Receiver<Vec<u8>>) {
-        let (sender, receiver) = mpsc::channel(capacity);
-        (
-            Input {
-                sender,
-                failed: Arc::new(AtomicBool::new(false)),
-                min_hold: Duration::from_millis(250),
-                speech: false,
-                checked_samples: 0,
-                sent_samples: 0,
-            },
-            receiver,
-        )
-    }
-
-    async fn endpoint() -> (TcpListener, Request<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let request = format!("ws://{}/", listener.local_addr().unwrap())
-            .into_client_request()
-            .unwrap();
-        (listener, request)
-    }
+    type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
     fn result(text: &str, is_final: bool) -> Message {
         Message::text(
             serde_json::json!({
                 "type": "Results",
                 "is_final": is_final,
+                "speech_final": is_final,
                 "channel": {"alternatives": [{"transcript": text}]},
             })
             .to_string(),
         )
     }
 
-    #[test]
-    fn speech_gate_retains_prefix_and_sends_each_sample_once() {
-        let (mut input, mut receiver) = input_channel(2);
-        let mut samples = vec![0; 800];
-        input.push(&samples, Duration::from_millis(50));
-        samples.extend(vec![2000; 800]);
-        input.push(&samples, Duration::from_millis(100));
-        assert!(receiver.try_recv().is_err());
-        samples.extend(vec![0; 2400]);
-        input.push(&samples, Duration::from_millis(250));
-        let prefix = receiver.try_recv().unwrap();
-        assert_eq!(prefix.len(), samples.len() * 2);
-        assert_eq!(&prefix[1600..1602], &2000i16.to_le_bytes());
-        samples.extend(vec![3000; 800]);
-        input.push(&samples, Duration::from_millis(300));
-        let tail = receiver.try_recv().unwrap();
-        assert_eq!(tail.len(), 1600);
-        assert_eq!(&tail[..2], &3000i16.to_le_bytes());
+    fn metadata() -> Message {
+        Message::text(r#"{"type":"Metadata","request_id":"r"}"#)
     }
 
-    #[test]
-    fn silence_is_not_transmitted() {
-        let (mut input, mut receiver) = input_channel(1);
-        input.push(&vec![3; 16_000], Duration::from_secs(1));
-        assert!(receiver.try_recv().is_err());
-        assert!(!input.failed.load(Ordering::Relaxed));
+    fn token_after(delay: Duration) -> TokenFuture {
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok("test-token".to_string())
+        })
     }
 
-    #[test]
-    fn a_full_queue_marks_the_session_failed_without_blocking_capture() {
-        let (mut input, mut receiver) = input_channel(1);
-        let mut samples = vec![2000; 800];
-        input.push(&samples, Duration::from_millis(250));
-        samples.extend(vec![3000; 800]);
-        input.push(&samples, Duration::from_millis(300));
-        assert!(input.failed.load(Ordering::Relaxed));
-        assert_eq!(samples.len(), 1600);
-        assert_eq!(receiver.try_recv().unwrap().len(), 1600);
-        assert!(receiver.try_recv().is_err());
+    fn chunk(value: i16) -> Vec<i16> {
+        vec![value; 800]
     }
 
-    #[test]
-    fn query_encodes_vocabulary_and_redacts_credentials() {
-        let settings = Settings {
-            vocabulary: vec!["T3 Code & 9Router".into()],
-            ..Settings::default()
-        };
-        let request = request(&settings, "test-key").unwrap();
-        let url = reqwest::Url::parse(&request.uri().to_string()).unwrap();
-        assert!(url
-            .query_pairs()
-            .any(|(name, value)| { name == "keyterm" && value == "T3 Code & 9Router" }));
-        assert!(url
-            .query_pairs()
-            .any(|(name, value)| name == "sample_rate" && value == "16000"));
-        assert!(request.headers()["Authorization"].is_sensitive());
-        assert!(super::request(&settings, "invalid\nkey").is_err());
-    }
-
-    #[tokio::test]
-    async fn streams_before_release_and_waits_for_the_final_tail() {
-        let (listener, request) = endpoint().await;
-        let (mut input, receiver) = input_channel(2);
-        let failed = input.failed.clone();
-        let (heard_sender, heard_receiver) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
+    /// A mock Deepgram that checks the Bearer token and hands the socket to `script`.
+    async fn server<F, Fut>(script: F) -> (String, tokio::task::JoinHandle<()>)
+    where
+        F: FnOnce(Socket) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/listen", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
             let (connection, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
-            let mut heard_sender = Some(heard_sender);
-            let mut audio = Vec::new();
-            while let Some(message) = socket.next().await {
-                match message.unwrap() {
-                    Message::Binary(bytes) => {
-                        audio.extend_from_slice(&bytes);
-                        if let Some(sender) = heard_sender.take() {
-                            socket.send(result("Wrong interim", false)).await.unwrap();
-                            socket.send(result("Use T3 Code", true)).await.unwrap();
-                            sender.send(()).unwrap();
-                        }
-                    }
-                    Message::Text(text) if text.contains("CloseStream") => {
-                        assert_eq!(audio.len(), 3200);
-                        assert_eq!(&audio[..2], &2000i16.to_le_bytes());
-                        assert_eq!(&audio[1600..1602], &3000i16.to_le_bytes());
-                        socket
-                            .send(result("with config.toml.", true))
-                            .await
-                            .unwrap();
-                        socket
-                            .send(Message::text(r#"{"type":"Metadata"}"#))
-                            .await
-                            .unwrap();
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            panic!("Missing CloseStream");
-        });
-        let task = tokio::spawn(transcribe(
-            request,
-            receiver,
-            failed,
-            Duration::from_secs(2),
-        ));
-        let mut samples = vec![2000; 800];
-        input.push(&samples, Duration::from_millis(250));
-        tokio::time::timeout(Duration::from_secs(2), heard_receiver)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!task.is_finished());
-        samples.extend(vec![3000; 800]);
-        input.push(&samples, Duration::from_millis(300));
-        drop(input);
-        let transcript = tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(transcript.text, "Use T3 Code with config.toml.");
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn early_disconnect_never_returns_a_partial_transcript() {
-        let (listener, request) = endpoint().await;
-        let (input, receiver) = input_channel(1);
-        let failed = input.failed.clone();
-        let server = tokio::spawn(async move {
-            let (connection, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
-            socket.send(result("Partial prompt", true)).await.unwrap();
-            socket.close(None).await.unwrap();
-        });
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(2),
-            transcribe(request, receiver, failed, Duration::from_secs(1)),
-        )
-        .await
-        .unwrap();
-        assert!(outcome
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("before transcription completed"));
-        drop(input);
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn provider_errors_never_return_a_partial_transcript() {
-        let (listener, request) = endpoint().await;
-        let (input, receiver) = input_channel(1);
-        let server = tokio::spawn(async move {
-            let (connection, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
-            socket.send(result("Partial prompt", true)).await.unwrap();
-            socket
-                .send(Message::text(r#"{"type":"Error","description":"failure"}"#))
+            // The error type is fixed by tungstenite's callback signature.
+            #[allow(clippy::result_large_err)]
+            let check = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                         response| {
+                assert_eq!(request.headers()["Authorization"], "Bearer test-token");
+                assert!(!request.uri().to_string().contains("test-token"));
+                Ok(response)
+            };
+            let socket = tokio_tungstenite::accept_hdr_async(connection, check)
                 .await
                 .unwrap();
+            script(socket).await;
         });
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(2),
-            transcribe(
-                request,
-                receiver,
-                input.failed.clone(),
-                Duration::from_secs(1),
-            ),
-        )
-        .await
-        .unwrap();
-        assert!(outcome
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("streaming error"));
-        drop(input);
+        (url, handle)
+    }
+
+    /// Reads until CloseStream, returning all audio bytes received before it.
+    async fn audio_until_close(socket: &mut Socket) -> Vec<u8> {
+        let mut audio = Vec::new();
+        while let Some(Ok(message)) = socket.next().await {
+            match message {
+                Message::Binary(bytes) => audio.extend_from_slice(&bytes),
+                Message::Text(text) if text.contains("CloseStream") => return audio,
+                _ => {}
+            }
+        }
+        panic!("missing CloseStream");
+    }
+
+    fn samples_of(audio: &[u8]) -> Vec<i16> {
+        audio
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes(*b))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn audio_before_a_slow_token_and_connection_is_replayed_in_order() {
+        let (url, server) = server(|mut socket| async move {
+            let audio = audio_until_close(&mut socket).await;
+            let expected: Vec<i16> = (0..40).flat_map(|i| chunk(i as i16)).collect();
+            assert_eq!(samples_of(&audio), expected);
+            socket.send(result("hello world", true)).await.unwrap();
+            socket.send(metadata()).await.unwrap();
+        })
+        .await;
+        let (session, sink) = spawn(token_after(Duration::from_millis(300)), url);
+        for i in 0..40 {
+            sink.push(&chunk(i));
+        }
+        assert!(session.stats.lock().unwrap().token.is_none());
+        drop(sink);
+        let text = session.finish(Duration::from_secs(3)).await.unwrap();
+        assert_eq!(text, "hello world");
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn finalization_timeout_aborts_the_socket() {
-        let (listener, request) = endpoint().await;
-        let (input, receiver) = input_channel(1);
-        let server = tokio::spawn(async move {
-            let (connection, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
-            while let Some(Ok(message)) = socket.next().await {
-                if let Message::Text(text) = message {
-                    if text.contains("CloseStream") {
-                        assert!(matches!(
-                            socket.next().await,
-                            None | Some(Err(_)) | Some(Ok(Message::Close(_)))
-                        ));
-                        return;
-                    }
-                }
-            }
-            panic!("Missing CloseStream");
-        });
-        let task = tokio::spawn(transcribe(
-            request,
-            receiver,
-            input.failed.clone(),
-            Duration::from_secs(1),
-        ));
-        let session = Session {
-            task: tauri::async_runtime::JoinHandle::Tokio(task),
-            timeout: Duration::from_millis(500),
-            failed: input.failed.clone(),
-        };
-        drop(input);
-        let error = session.finish().await.err().unwrap();
-        assert!(error.to_string().contains("finalization timed out"));
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap();
+    async fn interim_revisions_are_never_delivered_and_finals_join_in_order() {
+        let (url, server) = server(|mut socket| async move {
+            socket.next().await;
+            socket.send(result("deploy to", false)).await.unwrap();
+            socket.send(result("deploy tomorrow", false)).await.unwrap();
+            socket.send(result("Deploy tomorrow.", true)).await.unwrap();
+            socket.send(result("no change", false)).await.unwrap();
+            // A long pause: the server stays quiet, the client keeps the session open.
+            audio_until_close(&mut socket).await;
+            socket
+                .send(result("No, change that to Monday.", true))
+                .await
+                .unwrap();
+            socket.send(result("", true)).await.unwrap();
+            socket.send(metadata()).await.unwrap();
+        })
+        .await;
+        let (session, sink) = spawn(token_after(Duration::ZERO), url);
+        sink.push(&chunk(1));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..200 {
+            sink.push(&chunk(2));
+        }
+        drop(sink);
+        let text = session.finish(Duration::from_secs(3)).await.unwrap();
+        assert_eq!(text, "Deploy tomorrow. No, change that to Monday.");
+        server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn cancelling_drops_the_socket_even_while_capture_is_active() {
-        let (listener, request) = endpoint().await;
-        let (mut input, receiver) = input_channel(1);
-        let (heard_sender, heard_receiver) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (connection, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
-            while let Some(Ok(message)) = socket.next().await {
-                if matches!(message, Message::Binary(_)) {
-                    heard_sender.send(()).unwrap();
-                    loop {
-                        match socket.next().await {
-                            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
-                            Some(Ok(Message::Text(text))) => {
-                                assert!(text.contains("KeepAlive"));
-                            }
-                            _ => panic!("Unexpected audio after cancellation"),
-                        }
-                    }
-                    return;
-                }
-            }
-            panic!("Missing audio");
-        });
-        let task = tokio::spawn(transcribe(
-            request,
-            receiver,
-            input.failed.clone(),
-            Duration::from_secs(1),
-        ));
-        let session = Session {
-            task: tauri::async_runtime::JoinHandle::Tokio(task),
-            timeout: Duration::from_secs(1),
-            failed: input.failed.clone(),
-        };
-        input.push(&vec![2000; 800], Duration::from_millis(250));
-        tokio::time::timeout(Duration::from_secs(2), heard_receiver)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(session);
-        tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(input);
+    async fn the_tail_pushed_just_before_release_is_sent_before_finalize() {
+        let (url, server) = server(|mut socket| async move {
+            let audio = audio_until_close(&mut socket).await;
+            assert_eq!(*samples_of(&audio).last().unwrap(), 7);
+            socket.send(result("tail", true)).await.unwrap();
+            socket.send(metadata()).await.unwrap();
+        })
+        .await;
+        let (session, sink) = spawn(token_after(Duration::ZERO), url);
+        sink.push(&chunk(1));
+        sink.push(&chunk(7));
+        drop(sink);
+        assert_eq!(
+            session.finish(Duration::from_secs(3)).await.unwrap(),
+            "tail"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn a_short_tap_cannot_send_a_late_capture_callback() {
-        let (mut input, mut receiver) = input_channel(1);
-        let samples = vec![2000; 800];
-        input.push(&samples, Duration::from_millis(240));
-        let task = tokio::spawn(std::future::pending::<Result<Transcript>>());
-        let session = Session {
-            task: tauri::async_runtime::JoinHandle::Tokio(task),
-            timeout: Duration::from_secs(1),
-            failed: input.failed.clone(),
-        };
-        drop(session);
-        input.push(&samples, Duration::from_millis(260));
-        assert!(receiver.try_recv().is_err());
-        assert_eq!(input.sent_samples, 0);
+    async fn metadata_before_closestream_does_not_complete_the_session() {
+        let (url, server) = server(|mut socket| async move {
+            socket.next().await;
+            socket.send(result("early", true)).await.unwrap();
+            socket.send(metadata()).await.unwrap();
+            audio_until_close(&mut socket).await;
+            socket.send(result("late", true)).await.unwrap();
+            socket.send(metadata()).await.unwrap();
+        })
+        .await;
+        let (session, sink) = spawn(token_after(Duration::ZERO), url);
+        sink.push(&chunk(1));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(sink);
+        assert_eq!(
+            session.finish(Duration::from_secs(3)).await.unwrap(),
+            "early late"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn a_close_without_terminal_metadata_never_completes_finalization() {
-        use tokio_tungstenite::tungstenite::{
-            protocol::frame::coding::CloseCode, protocol::CloseFrame,
-        };
+    async fn a_close_without_terminal_metadata_fails() {
         for frame in [
             None,
             Some(CloseFrame {
-                code: CloseCode::Away,
-                reason: "shutting down".into(),
-            }),
-            Some(CloseFrame {
-                code: CloseCode::Normal,
+                code: 1000.into(),
                 reason: "".into(),
             }),
         ] {
-            let (listener, request) = endpoint().await;
-            let (mut input, receiver) = input_channel(1);
-            let server = tokio::spawn(async move {
-                let (connection, _) = listener.accept().await.unwrap();
-                let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
-                while let Some(Ok(message)) = socket.next().await {
-                    match message {
-                        Message::Binary(_) => {
-                            socket.send(result("Partial prompt", true)).await.unwrap();
-                        }
-                        Message::Text(text) if text.contains("CloseStream") => {
-                            socket.send(Message::Close(frame)).await.unwrap();
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                panic!("Missing CloseStream");
-            });
-            let failed = input.failed.clone();
-            input.push(&vec![2000; 800], Duration::from_millis(250));
-            drop(input);
-            let outcome = tokio::time::timeout(
-                Duration::from_secs(2),
-                transcribe(request, receiver, failed, Duration::from_secs(1)),
-            )
-            .await
-            .unwrap();
-            assert!(outcome
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("before transcription completed"));
+            let (url, server) = server(move |mut socket| async move {
+                audio_until_close(&mut socket).await;
+                socket.send(result("partial", true)).await.unwrap();
+                socket.send(Message::Close(frame)).await.unwrap();
+            })
+            .await;
+            let (session, sink) = spawn(token_after(Duration::ZERO), url);
+            sink.push(&chunk(1));
+            drop(sink);
+            let error = session.finish(Duration::from_secs(3)).await.unwrap_err();
+            assert_eq!(reason(&error), "disconnected");
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_disconnect_fails_without_partial_text() {
+        let (url, server) = server(|mut socket| async move {
+            socket.next().await;
+            socket.send(result("half a", true)).await.unwrap();
+            drop(socket);
+        })
+        .await;
+        let (session, sink) = spawn(token_after(Duration::ZERO), url);
+        sink.push(&chunk(1));
+        server.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sink.push(&chunk(2));
+        drop(sink);
+        let error = session.finish(Duration::from_secs(3)).await.unwrap_err();
+        assert_eq!(reason(&error), "disconnected");
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_hits_the_finalize_deadline() {
+        let (url, server) = server(|mut socket| async move {
+            audio_until_close(&mut socket).await;
+            socket.send(result("partial", true)).await.unwrap();
+            // Never sends Metadata; waits for the client to give up.
+            while socket.next().await.is_some() {}
+        })
+        .await;
+        let (session, sink) = spawn(token_after(Duration::ZERO), url);
+        sink.push(&chunk(1));
+        drop(sink);
+        let started = Instant::now();
+        let error = session
+            .finish(Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "finalize_timeout");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_failure_is_reported_as_the_fallback_reason() {
+        let token: TokenFuture = Box::pin(async { Err(fail("rate_limited", "429")) });
+        let (session, sink) = spawn(token, "ws://127.0.0.1:9/".into());
+        sink.push(&chunk(1));
+        drop(sink);
+        let error = session.finish(Duration::from_secs(1)).await.unwrap_err();
+        assert_eq!(reason(&error), "rate_limited");
+    }
+
+    #[tokio::test]
+    async fn rejected_and_unreachable_connections_fail_setup() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut connection, _) = listener.accept().await.unwrap();
+            connection
+                .write_all(b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let (session, sink) = spawn(token_after(Duration::ZERO), format!("ws://{address}/"));
+        drop(sink);
+        let error = session.finish(Duration::from_secs(3)).await.unwrap_err();
+        assert_eq!(reason(&error), "rate_limited");
+        server.await.unwrap();
+
+        let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = unused.local_addr().unwrap();
+        drop(unused);
+        let (session, sink) = spawn(token_after(Duration::ZERO), format!("ws://{address}/"));
+        drop(sink);
+        let error = session.finish(Duration::from_secs(3)).await.unwrap_err();
+        assert_eq!(reason(&error), "connect");
+    }
+
+    #[tokio::test]
+    async fn overflow_stops_the_session_instead_of_dropping_middle_audio() {
+        let (session, sink) = spawn(Box::pin(std::future::pending()), "ws://127.0.0.1:9/".into());
+        let chunks = MAX_QUEUED_BYTES / 1600;
+        for _ in 0..chunks {
+            sink.push(&chunk(1));
+        }
+        assert!(!sink.stopped.load(Ordering::SeqCst));
+        sink.push(&chunk(1));
+        assert!(sink.stopped.load(Ordering::SeqCst));
+        drop(sink);
+        let error = session.finish(Duration::from_secs(1)).await.unwrap_err();
+        assert_eq!(reason(&error), "queue_overflow");
+    }
+
+    #[tokio::test]
+    async fn cancelling_closes_the_socket_and_stops_accepting_audio() {
+        let (heard_sender, heard) = tokio::sync::oneshot::channel();
+        let (url, server) = server(|mut socket| async move {
+            assert!(matches!(socket.next().await, Some(Ok(Message::Binary(_)))));
+            heard_sender.send(()).unwrap();
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(Message::Text(text))) => assert!(!text.contains("CloseStream")),
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        let (session, sink) = spawn(token_after(Duration::ZERO), url);
+        sink.push(&chunk(1));
+        heard.await.unwrap();
+        drop(session);
+        sink.push(&chunk(2));
+        assert!(sink.stopped.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_the_token_arrives_never_connects() {
+        let (session, sink) = spawn(Box::pin(std::future::pending()), "ws://127.0.0.1:9/".into());
+        sink.push(&chunk(1));
+        let stats = session.stats.clone();
+        drop(session);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(stats.lock().unwrap().connected.is_none());
+    }
+
+    #[test]
+    fn listen_url_carries_keyterms_but_no_secret() {
+        let terms = vec![
+            "Cargo.toml".into(),
+            "@tanstack/react-query".into(),
+            "cargo.toml".into(),
+        ];
+        let url = listen_url(LISTEN_URL, "nova-3", "en", &terms);
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let keyterms: Vec<_> = parsed
+            .query_pairs()
+            .filter(|(k, _)| k == "keyterm")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(keyterms, ["Cargo.toml", "@tanstack/react-query"]);
+        assert!(url.contains("interim_results=true"));
+        assert!(url.contains("encoding=linear16") && url.contains("sample_rate=16000"));
+        assert!(listen_url(LISTEN_URL, "nova-3", "auto", &[]).contains("language=multi"));
+        assert!(!listen_url(LISTEN_URL, "nova-3", "en", &[]).contains("keyterm"));
+        let many: Vec<String> = (0..80).map(|i| format!("term{i}")).collect();
+        assert_eq!(
+            listen_url(LISTEN_URL, "nova-3", "en", &many)
+                .matches("keyterm")
+                .count(),
+            MAX_KEYTERMS
+        );
     }
 }

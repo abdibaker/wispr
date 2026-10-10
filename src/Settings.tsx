@@ -13,6 +13,8 @@ type SettingsData = {
   endpoint: string;
   stt_model: string;
   language: string;
+  streaming: boolean;
+  streaming_model: string;
   cleanup_enabled: boolean;
   cleanup_model: string;
   reasoning_effort: string;
@@ -261,6 +263,9 @@ function Speech({ settings, update }: SectionProps) {
       </Row>
       <Row label="Language" hint="ISO code such as en, or auto.">
         <Text value={settings.language} onSave={(language) => update({ language })} spellCheck={false} />
+      </Row>
+      <Row label="Live transcription" hint="Streams audio to Deepgram while you speak. The model above is the fallback.">
+        <Toggle checked={settings.streaming} onChange={(streaming) => update({ streaming })} />
       </Row>
       <div className="actions">
         <button onClick={runTest} disabled={testing}>

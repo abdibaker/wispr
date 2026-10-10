@@ -403,10 +403,10 @@ def latency(args):
             fields = line.split(" latency ", 1)[1]
             # first_audio=na means no chunk arrived: absent, not zero.
             rows.append({k: int(v) for k, v in re.findall(r"(\w+)=(\d+)\b", fields)})
-            labels.append(dict(re.findall(r"(outcome|delivery|destination)=(\S+)", fields)))
+            labels.append(dict(re.findall(r"(outcome|delivery|destination|stt_mode|fallback_reason)=(\S+)", fields)))
     if not rows:
         sys.exit("no new-format latency lines")
-    for key in ("outcome", "delivery", "destination"):
+    for key in ("outcome", "delivery", "destination", "stt_mode", "fallback_reason"):
         counts = {}
         for label in labels:
             counts[label.get(key, "unlogged")] = counts.get(label.get(key, "unlogged"), 0) + 1

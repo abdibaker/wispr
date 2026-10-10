@@ -4,6 +4,7 @@
 # and a GTK window receives the text. The app runs from target/debug with an isolated
 # config/data dir (your settings and history are untouched; the keyring key is reused).
 # Override settings with VP_CLEANUP_MODEL, VP_REASONING_EFFORT, VP_STT_MODEL, VP_INSERTION_METHOD,
+# VP_STREAMING (1 = Deepgram live, 0 = batch only),
 # and the binaries with VP_DEBUG (a directory holding voice-prompt and examples/ptt).
 # Prints the app's latency lines. Needs a Wayland session; do not type while it runs.
 set -eu
@@ -29,6 +30,8 @@ import os
 for key in ("cleanup_model", "reasoning_effort", "stt_model", "insertion_method"):
     if os.environ.get("VP_" + key.upper()):
         user[key] = os.environ["VP_" + key.upper()]
+if os.environ.get("VP_STREAMING"):
+    user["streaming"] = os.environ["VP_STREAMING"] == "1"
 user.update(microphone="vp_bench.monitor", autostart=False, sounds=False, notifications=False, history_enabled=True)
 pathlib.Path(sys.argv[1]).write_text(json.dumps(user))
 PY

@@ -21,6 +21,9 @@ pub struct Settings {
     pub endpoint: String,
     pub stt_model: String,
     pub language: String,
+    /// Stream audio to Deepgram while the key is held; batch STT stays the fallback.
+    pub streaming: bool,
+    pub streaming_model: String,
     // Cleanup
     pub cleanup_enabled: bool,
     pub cleanup_model: String,
@@ -54,6 +57,8 @@ impl Default for Settings {
             // ponytail: spec's groq/distil-whisper-large-v3-en is decommissioned upstream.
             stt_model: "groq/whisper-large-v3-turbo".into(),
             language: "en".into(),
+            streaming: true,
+            streaming_model: "nova-3".into(),
             cleanup_enabled: true,
             // Fastest model passing the full cleanup corpus (bench/results, 2026-10-09).
             cleanup_model: "claude-haiku-5-5".into(),

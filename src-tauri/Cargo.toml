@@ -35,6 +35,8 @@ log = { version = "0.4", features = ["std"] }
 anyhow = "1"
 async-trait = "0.1"
 memfd = "0.6"
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

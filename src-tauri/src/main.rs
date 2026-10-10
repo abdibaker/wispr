@@ -6,6 +6,7 @@ mod insertion;
 mod logger;
 mod providers;
 mod settings;
+mod streaming;
 mod target;
 
 use anyhow::{anyhow, Result};
@@ -58,13 +59,29 @@ struct Latency {
     delivery: String,
     /// confirmed | changed | unknown: the press-time window versus the window at delivery.
     destination: &'static str,
+    /// streaming_deepgram | batch_fallback | batch (streaming off, or a retry)
+    stt_mode: &'static str,
+    /// Why streaming produced no trusted transcript; empty unless `batch_fallback`.
+    fallback_reason: &'static str,
+    /// Streaming stages, in ms since key press; `None` when the stage never happened.
+    token_ms: Option<u64>,
+    connected_ms: Option<u64>,
+    first_sent_ms: Option<u64>,
+    first_partial_ms: Option<u64>,
+    first_final_ms: Option<u64>,
+    released_ms: Option<u64>,
+    last_sent_ms: Option<u64>,
+    finalize_sent_ms: Option<u64>,
+    /// Release → complete raw transcript, whichever path produced it.
+    release_to_stt_ms: Option<u64>,
+    /// Release → cleaned (or raw fallback) text ready for delivery.
+    release_to_cleaned_ms: Option<u64>,
 }
 
 impl Latency {
     fn log(&self, chars: usize) {
-        let first_audio = self
-            .capture_to_first_audio_ms
-            .map_or("na".into(), |ms| ms.to_string());
+        let na = |value: Option<u64>| value.map_or("na".into(), |ms| ms.to_string());
+        let first_audio = na(self.capture_to_first_audio_ms);
         let timed = self.finish_ms
             + self.keyring_ms
             + self.wav_ms
@@ -82,7 +99,10 @@ impl Latency {
             "latency total={} audio={} chars={} idle={} capture={} first_audio={} finish={} keyring={} wav={} \
              stt_setup={} stt_wait={} stt_read={} stt_norm={} cleanup_setup={} cleanup_wait={} cleanup_read={} \
              cleanup_norm={} cleanup_total={} cleanup_attempts={} history={} held_wait={} insert_setup={} \
-             insert_keys={} clipboard={} untimed={} outcome={} delivery={} destination={}",
+             insert_keys={} clipboard={} untimed={} outcome={} delivery={} destination={} \
+             stt_mode={} fallback_reason={} release_to_stt={} release_to_cleaned={} token={} \
+             connected={} first_sent={} first_partial={} first_final={} released={} last_sent={} \
+             finalize_sent={}",
             self.release_to_delivered_ms,
             self.audio_ms,
             chars,
@@ -111,6 +131,18 @@ impl Latency {
             or_na(&self.outcome),
             or_na(&self.delivery),
             or_na(self.destination),
+            or_na(self.stt_mode),
+            or_na(self.fallback_reason),
+            na(self.release_to_stt_ms),
+            na(self.release_to_cleaned_ms),
+            na(self.token_ms),
+            na(self.connected_ms),
+            na(self.first_sent_ms),
+            na(self.first_partial_ms),
+            na(self.first_final_ms),
+            na(self.released_ms),
+            na(self.last_sent_ms),
+            na(self.finalize_sent_ms),
         );
     }
 }
@@ -153,6 +185,11 @@ struct Session {
     latency: Latency,
     /// The window active at key press: the intended destination.
     target: Option<target::Window>,
+    /// Live transcription; dropping it cancels the socket without finalizing.
+    stream: Option<streaming::StreamSession>,
+    /// Chosen at press from the target window; see `context_vocabulary`.
+    vocabulary: Vec<String>,
+    technical: bool,
 }
 
 struct AppState {
@@ -251,12 +288,28 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
             // Before the overlay or any cue can disturb focus.
             let target = state.windows.as_ref().and_then(target::Tracker::active);
             let settings = state.settings.lock().unwrap().clone();
+            let (vocabulary, technical) = context_vocabulary(&settings, target.as_ref());
+            // The queue exists before token and connection work starts, so early speech is kept.
+            let (stream, sink) = if settings.streaming {
+                let transcriber =
+                    streaming::DeepgramStreamingTranscriber::new(state.client.clone(), &settings);
+                use streaming::StreamingTranscriber;
+                let keyterms = if technical { &vocabulary[..] } else { &[] };
+                let (stream, sink) = transcriber.start(keyterms);
+                (Some(stream), Some(sink))
+            } else {
+                (None, None)
+            };
             let capture_started = Instant::now();
             let level_app = app.clone();
             match audio::Recording::start(
                 &settings.microphone,
                 settings.max_record_secs,
-                move |level| {
+                move |chunk| {
+                    if let Some(sink) = &sink {
+                        sink.push(chunk);
+                    }
+                    let level = audio::rms(chunk);
                     let _ = level_app.emit_to(
                         "overlay",
                         "overlay",
@@ -280,6 +333,9 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
                         capture_started,
                         latency,
                         target,
+                        stream,
+                        vocabulary,
+                        technical,
                     });
                     if settings.sounds {
                         audio::beep(880.0, 60);
@@ -321,12 +377,20 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
                 audio::beep(660.0, 60);
             }
             let busy = session.busy;
-            let target = session.target;
             let held = released - session.pressed;
+            let dictation = Dictation {
+                pressed: Some(session.pressed),
+                released,
+                held,
+                target: session.target,
+                stream: session.stream,
+                vocabulary: session.vocabulary,
+                technical: session.technical,
+            };
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let result = match samples {
-                    Ok(samples) => process(&app, samples, latency, released, held, target).await,
+                    Ok(samples) => process(&app, samples, latency, dictation).await,
                     Err(error) => Err(error),
                 };
                 drop(busy);
@@ -341,15 +405,49 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
     }
 }
 
+/// Deepgram's flush after CloseStream normally takes a few hundred ms; past this the
+/// session is untrusted and the retained recording goes to batch STT.
+const FINALIZE_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Window file names plus the global vocabulary, and whether STT should be biased toward
+/// them. A global STT hint steers unrelated prose toward product names, so STT gets terms
+/// only where technical dictation is likely: editors, terminals, and windows showing a
+/// file. Cleanup always filters the list to terms the transcript mentions.
+fn context_vocabulary(settings: &Settings, target: Option<&target::Window>) -> (Vec<String>, bool) {
+    let mut vocabulary = target.map_or(vec![], |w| settings::title_terms(&w.title));
+    let technical = !vocabulary.is_empty() || target.is_some_and(target::Window::is_technical);
+    vocabulary.extend(settings.vocabulary.iter().cloned());
+    (vocabulary, technical)
+}
+
+/// One recording on its way to delivery.
+struct Dictation {
+    /// `None` for a retry, which has no live session.
+    pressed: Option<Instant>,
+    released: Instant,
+    held: Duration,
+    target: Option<target::Window>,
+    stream: Option<streaming::StreamSession>,
+    vocabulary: Vec<String>,
+    technical: bool,
+}
+
 /// The voice pipeline: STT → optional cleanup → insertion, never dropping a successful transcript.
 async fn process(
     app: &AppHandle,
     samples: Vec<i16>,
     mut latency: Latency,
-    released: Instant,
-    held: Duration,
-    target: Option<target::Window>,
+    dictation: Dictation,
 ) -> Result<()> {
+    let Dictation {
+        pressed,
+        released,
+        held,
+        target,
+        stream,
+        vocabulary,
+        technical,
+    } = dictation;
     let state = app.state::<AppState>();
     let settings = state.settings.lock().unwrap().clone();
     let audio_ms = samples.len() as u64 * 1000 / audio::RATE as u64;
@@ -372,25 +470,71 @@ async fn process(
         timeout: Duration::from_secs(settings.stt_timeout_secs),
         reasoning_effort: String::new(),
     };
-    let encoding = Instant::now();
-    let wav = providers::wav(&samples, audio::RATE);
-    latency.wav_ms = ms(encoding);
-    // A global hint steers unrelated prose toward product names, so send vocabulary only
-    // where technical dictation is likely: editors, terminals, and windows showing a file.
-    let mut vocabulary = target
-        .as_ref()
-        .map_or(vec![], |w| settings::title_terms(&w.title));
-    let technical =
-        !vocabulary.is_empty() || target.as_ref().is_some_and(target::Window::is_technical);
-    vocabulary.extend(settings.vocabulary.iter().cloned());
-    let hint = technical
-        .then(|| settings::vocabulary_hint(&vocabulary))
-        .flatten();
-    let transcript = match stt.transcribe(wav, &settings.language, hint).await {
+    latency.stt_mode = "batch";
+    let mut streamed = None;
+    if let Some(stream) = stream {
+        let stats = stream.stats.clone();
+        let finishing = Instant::now();
+        let result = stream.finish(FINALIZE_DEADLINE).await;
+        latency.stt_wait_ms = ms(finishing);
+        if let Some(pressed) = pressed {
+            let since = |at: Option<Instant>| {
+                at.map(|at| at.saturating_duration_since(pressed).as_millis() as u64)
+            };
+            let stats = *stats.lock().unwrap();
+            latency.token_ms = since(stats.token);
+            latency.connected_ms = since(stats.connected);
+            latency.first_sent_ms = since(stats.first_sent);
+            latency.first_partial_ms = since(stats.first_partial);
+            latency.first_final_ms = since(stats.first_final);
+            latency.released_ms = since(Some(released));
+            latency.last_sent_ms = since(stats.last_sent);
+            latency.finalize_sent_ms = since(stats.finalize_sent);
+        }
+        match result {
+            // Metadata arrived but nothing was finalized for audio that is not silent:
+            // let batch STT have a go rather than report "nothing recognised".
+            Ok(text) if text.is_empty() => {
+                latency.stt_mode = "batch_fallback";
+                latency.fallback_reason = "empty";
+            }
+            Ok(text) => {
+                latency.stt_mode = "streaming_deepgram";
+                streamed = Some(text);
+            }
+            Err(error) => {
+                latency.stt_mode = "batch_fallback";
+                latency.fallback_reason = streaming::reason(&error);
+            }
+        }
+        if streamed.is_none() {
+            log::warn!(
+                "streaming STT failed ({}); replaying the full recording to batch STT",
+                latency.fallback_reason
+            );
+        }
+    }
+    let result = match streamed {
+        Some(text) => Ok(providers::Transcript {
+            text,
+            timing: Default::default(),
+        }),
+        None => {
+            let encoding = Instant::now();
+            let wav = providers::wav(&samples, audio::RATE);
+            latency.wav_ms = ms(encoding);
+            let hint = technical
+                .then(|| settings::vocabulary_hint(&vocabulary))
+                .flatten();
+            stt.transcribe(wav, &settings.language, hint).await
+        }
+    };
+    latency.release_to_stt_ms = Some(ms(released));
+    let transcript = match result {
         Ok(transcript) => {
             *state.failed_audio.lock().unwrap() = None;
             latency.stt_setup_ms = transcript.timing.setup_ms;
-            latency.stt_wait_ms = transcript.timing.wait_ms;
+            latency.stt_wait_ms += transcript.timing.wait_ms;
             latency.stt_read_ms = transcript.timing.body_ms;
             latency.stt_normalize_ms = transcript.timing.normalize_ms;
             transcript
@@ -462,6 +606,7 @@ async fn process(
         latency.outcome = "raw".into();
     }
     *state.last_request.lock().unwrap() = Some(Instant::now());
+    latency.release_to_cleaned_ms = Some(ms(released));
     let prompt = cleaned.clone().unwrap_or_else(|| transcript.text.clone());
     *state.last_prompt.lock().unwrap() = Some(prompt.clone());
 
@@ -478,7 +623,11 @@ async fn process(
             "raw"
         }
         .into(),
-        stt_model: settings.stt_model.clone(),
+        stt_model: if latency.stt_mode == "streaming_deepgram" {
+            format!("deepgram/{}", settings.streaming_model)
+        } else {
+            settings.stt_model.clone()
+        },
         cleanup_model: settings
             .cleanup_enabled
             .then(|| settings.cleanup_model.clone()),
@@ -831,15 +980,18 @@ fn retry_last(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         // A retry has no press-time window, so delivery falls back to the clipboard.
-        let result = process(
-            &app,
-            samples,
-            Latency::default(),
-            Instant::now(),
-            Duration::MAX,
-            None,
-        )
-        .await;
+        let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+        let (vocabulary, technical) = context_vocabulary(&settings, None);
+        let dictation = Dictation {
+            pressed: None,
+            released: Instant::now(),
+            held: Duration::MAX,
+            target: None,
+            stream: None,
+            vocabulary,
+            technical,
+        };
+        let result = process(&app, samples, Latency::default(), dictation).await;
         drop(busy);
         if let Err(error) = result {
             overlay(&app, "error", format!("{error}"));
@@ -1036,6 +1188,29 @@ mod tests {
         );
         drop(first);
         assert!(Busy::acquire(&flag).is_some());
+    }
+
+    #[test]
+    fn stt_vocabulary_is_contextual_but_cleanup_keeps_the_list() {
+        let settings = Settings::default();
+        let window = |app_id: &str, title: &str| target::Window {
+            id: "1".into(),
+            app_id: app_id.into(),
+            title: title.into(),
+        };
+        let (terms, technical) =
+            context_vocabulary(&settings, Some(&window("code", "main.rs - wispr")));
+        assert!(technical);
+        assert_eq!(terms[0], "main.rs");
+        assert!(terms.contains(&"9Router".to_string()));
+        let (terms, technical) =
+            context_vocabulary(&settings, Some(&window("signal", "Shopping list")));
+        assert!(!technical, "prose gets no STT keyterms");
+        assert_eq!(
+            terms, settings.vocabulary,
+            "cleanup still filters the global list"
+        );
+        assert!(settings::relevant_terms(&terms, "buy milk and eggs").is_empty());
     }
 
     #[test]

@@ -33,11 +33,12 @@ pub struct Recording {
 }
 
 impl Recording {
-    /// Starts capturing from `device` (empty = default source). `level` receives 0..1 RMS every ~50 ms.
+    /// Starts capturing from `device` (empty = default source). `on_chunk` receives each
+    /// ~50 ms chunk on the capture thread and is dropped when capture stops.
     pub fn start(
         device: &str,
         max_secs: u64,
-        level: impl Fn(f32) + Send + 'static,
+        mut on_chunk: impl FnMut(&[i16]) + Send + 'static,
     ) -> Result<Self> {
         let device = (!device.is_empty()).then(|| device.to_string());
         let chunk_bytes = RATE / 20 * 2;
@@ -81,7 +82,7 @@ impl Recording {
                         .iter()
                         .map(|b| i16::from_le_bytes(*b)),
                 );
-                level(rms(&samples[start..]));
+                on_chunk(&samples[start..]);
             }
             Ok(samples)
         });
