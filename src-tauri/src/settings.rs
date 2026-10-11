@@ -22,7 +22,7 @@ pub struct Settings {
     pub endpoint: String,
     pub stt_model: String,
     pub language: String,
-    /// Stream audio to Deepgram while the key is held; batch STT stays the fallback.
+    /// Stream audio live while the key is held; batch STT stays the fallback.
     pub streaming: bool,
     pub streaming_model: String,
     pub streaming_provider: StreamingProvider,
@@ -70,7 +70,8 @@ impl Default for Settings {
             language: "en".into(),
             streaming: true,
             streaming_model: "nova-3".into(),
-            streaming_provider: StreamingProvider::Deepgram,
+            // Beat Deepgram on latency, WER and term accuracy (bench/results/e2e-muse-*).
+            streaming_provider: StreamingProvider::Muse,
             cleanup_enabled: true,
             // Fastest model passing the full cleanup corpus (bench/results, 2026-10-09).
             cleanup_model: "claude-haiku-5-5".into(),
@@ -190,7 +191,7 @@ pub mod secret {
     const SERVICE: &str = "voice-prompt";
     /// The 9Router key, which also mints Deepgram tokens.
     pub const ROUTER: &str = "9router-api-key";
-    /// Meta Model API key for the experimental Muse provider; Muse has no token broker.
+    /// Meta Model API key for the default Muse provider; Muse has no token broker.
     pub const MUSE: &str = "meta-muse-api-key";
 
     fn entry(account: &str) -> Result<keyring::Entry> {
@@ -371,6 +372,8 @@ mod tests {
         let settings = load(dir.path());
         assert_eq!(settings.language, "de");
         assert_eq!(settings.shortcut, "Ctrl+Super");
+        assert_eq!(settings.streaming_provider, StreamingProvider::Muse);
+        assert!(settings.streaming);
     }
 
     #[test]

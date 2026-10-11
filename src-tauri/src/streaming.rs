@@ -1,10 +1,10 @@
 //! Live transcription: PCM streams from the capture thread straight to the provider while
 //! the key is held. Audio never passes through 9Router.
 //!
-//! - Deepgram (default): 9Router mints a short-lived token. After `CloseStream`, Deepgram
+//! - Deepgram: 9Router mints a short-lived token. After `CloseStream`, Deepgram
 //!   flushes the remaining results, sends `Metadata`, then closes; only that `Metadata`
 //!   completes a session. `is_final`, `speech_final`, silence or a bare close never do.
-//! - Meta Muse (experimental): the Meta key goes in the first JSON frame, not a header.
+//! - Meta Muse (default): the Meta key goes in the first JSON frame, not a header.
 //!   After `endStream`, a push-to-talk session ends with one `transcript` event marked
 //!   `final: true` and then a normal close (1000); anything else falls back to batch STT.
 use crate::{

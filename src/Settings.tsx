@@ -290,13 +290,13 @@ function Speech({ settings, update }: SectionProps) {
       <Row label="Language" hint="ISO code such as en, or auto.">
         <Text value={settings.language} onSave={(language) => update({ language })} spellCheck={false} />
       </Row>
-      <Row label="Live transcription" hint="Streams audio to Deepgram while you speak. The model above is the fallback.">
+      <Row label="Live transcription" hint="Streams audio while you speak. The model above is the fallback.">
         <Toggle checked={settings.streaming} onChange={(streaming) => update({ streaming })} />
       </Row>
       <Row label="Live transcription provider">
         <select value={settings.streaming_provider} onChange={(e) => update({ streaming_provider: e.target.value as SettingsData["streaming_provider"] })}>
+          <option value="muse">Meta Muse Voice Transcribe</option>
           <option value="deepgram">Deepgram Nova-3</option>
-          <option value="muse">Meta Muse Voice Transcribe (experimental)</option>
         </select>
       </Row>
       <Row label="Meta Muse API key" hint={hasMuseKey ? "Stored in the system keyring. Enter a new one to replace it." : "Not set. Only needed for Meta Muse."}>
