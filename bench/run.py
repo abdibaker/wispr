@@ -21,41 +21,43 @@ RESULTS = HERE / "results"
 STT_MODELS = ["groq/whisper-large-v3-turbo", "groq/whisper-large-v3"]
 # Prose clips whose transcripts must not gain vocabulary terms.
 CONTAMINATION = ["Codex", "T3 Code", "Claude Code", "9Router", "TanStack", "Tailscale", "Coolify", "shadcn"]
-# (model, reasoning_effort). "" omits the field, as the app does for "none".
+# (transport, model, reasoning_effort). "" omits the field, as the app does for "none".
 CLEANUP_CONFIGS = [
-    ("gpt-6-luna", "low"),  # current default
-    ("gpt-6-luna", ""),
-    ("gpt-6-luna", "medium"),
-    ("groq/llama-3.3-70b-versatile", ""),
-    ("groq/openai/gpt-oss-120b", "low"),
-    ("groq/qwen/qwen3-32b", ""),
-    ("glm-5.3-flash", ""),
-    ("gemini-3.8-flash", ""),
-    ("claude-haiku-5-5", ""),  # thinking off
-    ("claude-haiku-5-5", "low"),
-    ("claude-sonnet-5-5", ""),
+    ("router", "claude-haiku-5-5", ""),  # baseline, thinking off
+    ("groq", "openai/gpt-oss-20b", "low"),
+    ("router", "groq/openai/gpt-oss-20b", "low"),
+    ("groq", "openai/gpt-oss-20b", "medium"),
+    ("groq", "openai/gpt-oss-120b", "low"),
+    ("router", "groq/openai/gpt-oss-120b", "low"),
 ]
-
+GROQ_URL = "https://api.groq.com/openai/v1"
+# 9Router otherwise prepends its own style prompt to the system message.
+ROUTER_HEADERS = {"x-9router-token-saver": "off"}
+# 9Router adds a fixed buffer to reported prompt tokens; subtracted so paths compare.
+ROUTER_PROMPT_PAD = 2000
+# $ per 1M input/output tokens (Anthropic and Groq price pages, 2026-10).
+PRICES = {"claude-haiku-5-5": (0.10, 0.50), "gpt-oss-20b": (0.075, 0.30), "gpt-oss-120b": (0.15, 0.60)}
 
 def settings():
     return json.loads((pathlib.Path.home() / ".config/voice-prompt/settings.json").read_text())
 
 
-def credential():
-    key = os.environ.get("VP_KEY") or subprocess.run(
-        ["secret-tool", "lookup", "service", "voice-prompt", "username", "9router-api-key"],
+def credential(account="9router-api-key", env="VP_KEY"):
+    key = os.environ.get(env) or subprocess.run(
+        ["secret-tool", "lookup", "service", "voice-prompt", "username", account],
         capture_output=True, text=True, timeout=10).stdout.strip()
     if not key:
-        sys.exit("no API key (keyring or $VP_KEY)")
+        sys.exit(f"no {account} (keyring or ${env})")
     return key
 
 
 class Client:
     """One keep-alive HTTPS connection, like the app's pooled reqwest client."""
 
-    def __init__(self):
-        self.url = urllib.parse.urlsplit(settings()["endpoint"])
-        self.key = credential()
+    def __init__(self, url=None, key=None, headers=None):
+        self.url = urllib.parse.urlsplit(url or settings()["endpoint"])
+        self.key = key or credential()
+        self.headers = headers or {}
         self.conn = None
         self.pace = 0.0
         self.last = 0.0
@@ -65,17 +67,17 @@ class Client:
             self.conn.close()
         self.conn = None
 
-    def post(self, path, body, content_type, timeout=60):
+    def post(self, path, body, content_type, timeout=60, tries=4):
         """Paced and retried on 429: Groq allows 20 requests/minute per Whisper model.
         `wall_ms` covers every attempt and wait, so retried rows are not reported as fast."""
         started = None
-        for attempt in range(4):
+        for attempt in range(tries):
             if self.pace:
                 time.sleep(max(0, self.last + self.pace - time.monotonic()))
             started = started or time.perf_counter()  # pacing before the first attempt is ours, not the user's
             self.last = time.monotonic()
             out, parsed = self._post(path, body, content_type, timeout)
-            if out.get("status") != 429:
+            if out.get("status") != 429 or attempt + 1 == tries:
                 break
             print(f"  429, waiting 30 s (attempt {attempt + 1})", file=sys.stderr, flush=True)
             time.sleep(30)
@@ -91,13 +93,16 @@ class Client:
         started = time.perf_counter()
         try:
             self.conn.request("POST", self.url.path.rstrip("/") + path, body,
-                              {"Authorization": "Bearer " + self.key, "Content-Type": content_type})
+                              {"Authorization": "Bearer " + self.key, "Content-Type": content_type, **self.headers})
             response = self.conn.getresponse()
+            first_byte = ms(started)
             data = response.read()
         except (OSError, http.client.HTTPException) as error:
             self.reset()
             return {"error": type(error).__name__, "ms": ms(started), "cold": cold}, {}
-        out = {"status": response.status, "ms": ms(started), "cold": cold}
+        out = {"status": response.status, "ms": ms(started), "ttfb_ms": first_byte, "cold": cold}
+        if response.status == 429:
+            out["retry_after"] = response.getheader("retry-after")
         self.body = data
         try:
             parsed = json.loads(data)
@@ -186,6 +191,8 @@ def wer(reference, hypothesis):
 
 def contains(text, term, case=True):
     """Whole-token match: `15` does not match `150`, `whisper-large-v3` not `...-v3-turbo`."""
+    if not any(c.isalnum() for c in term):  # punctuation such as "?"
+        return term in text
     flags = 0 if case else re.IGNORECASE
     # A number may take a hyphenated unit ("250-millisecond"); an identifier may not grow ("-turbo").
     after = r"(?!\w|[./]\w)" if term.isdigit() else r"(?![\w-]|[./]\w)"
@@ -292,17 +299,20 @@ def report_stt(records):
 
 # ---------- cleanup ----------
 
-def system_prompt(vocabulary, extra=""):
-    """Mirror of OpenAiCompatible::clean's system message."""
+def app_prompt():
+    """CLEANUP_SYSTEM_PROMPT from providers.rs."""
     source = (ROOT / "src-tauri/src/providers.rs").read_text()
-    prompt = source.split('pub const CLEANUP_SYSTEM_PROMPT: &str = "', 1)[1].split('";', 1)[0]
-    prompt = prompt.replace("\\\n", "").replace('\\"', '"')
+    prompt = source.split('pub const CLEANUP_SYSTEM_PROMPT: &str = "', 1)[1].split('";\n', 1)[0]
+    return prompt.replace("\\\n", "").replace('\\"', '"')
+
+def system_prompt(vocabulary, extra="", prompt=None, label=None):
+    """Mirror of OpenAiCompatible::clean's system message."""
+    prompt = prompt or app_prompt()
     if vocabulary:
-        prompt += "\nVocabulary: " + ", ".join(vocabulary)
+        prompt += f"\n{label or VOCABULARY_LABEL}: " + ", ".join(vocabulary)
     if extra.strip():
         prompt += "\nAdditional user preferences: " + extra.strip()
     return prompt
-
 
 def squash(text):
     return "".join(c for c in text.lower() if c.isalnum())
@@ -320,24 +330,26 @@ def distance(a, b):
 def relevant(vocabulary, transcript, limit=24):
     """Mirror of settings::relevant_terms."""
     words = [w for w in (squash(t) for t in transcript.split()) if w and w not in ("dot", "slash", "dash", "underscore")]
+    spoken = "zero one two three four five six seven eight nine".split()
+    digits = [str(spoken.index(w)) if w in spoken else w for w in words]
     out, seen = [], set()
     for term in (t.strip() for t in vocabulary):
         key = squash(term)
         if not key or term.lower() in seen:
             continue
         seen.add(term.lower())
-        for start in range(len(words)):
-            run, hit = "", False
-            for joined, word in enumerate(words[start:start + 4]):
-                run += word
-                n = len(key)
-                allowed = n // 4 if n >= 8 else 1 if n >= 5 and joined else 0
-                if abs(len(run) - n) <= allowed and distance(run, key) <= allowed:
-                    hit = True
-                    break
-            if hit:
-                out.append(term)
-                break
+        def mentions(words):
+            for start in range(len(words)):
+                run = ""
+                for joined, word in enumerate(words[start:start + 4]):
+                    run += word
+                    n = len(key)
+                    allowed = n // 4 if n >= 8 else 1 if n >= 5 and joined else 0
+                    if abs(len(run) - n) <= allowed and distance(run, key) <= allowed:
+                        return True
+            return False
+        if mentions(words) or mentions(digits):
+            out.append(term)
     return out[:limit]
 
 
@@ -345,6 +357,8 @@ def judge(case, output):
     """Deterministic checks; returns a list of failures (empty = preserved)."""
     if output is None:
         return ["no output"]
+    # GPT-OSS writes "January\u202f15"; a narrow or non-breaking space is still a space.
+    output = re.sub(r"[\u00a0\u2007\u202f]", " ", output).replace("\u2019", "'")
     lower = output.lower()
     failures = []
     for term in case.get("exact", []):
@@ -364,56 +378,164 @@ def judge(case, output):
     return failures
 
 
+VOCABULARY_LABEL = "Spelling hints"
+# Candidate prompts, selected with --prompt; "app" is CLEANUP_SYSTEM_PROMPT. "label" names the
+# term list appended to the system message.
+PROMPTS = {"app": {}}
+PROMPTS_FILE = HERE / "prompts.json"
+if PROMPTS_FILE.exists():
+    PROMPTS.update(json.loads(PROMPTS_FILE.read_text()))
+
+def transport(name):
+    if name == "groq":
+        return Client(GROQ_URL, credential("groq-api-key", "VP_GROQ_KEY"))
+    return Client(headers=ROUTER_HEADERS)
+
+def output_budget(raw):
+    """Mirror of providers::output_budget."""
+    return len(raw.encode()) // 2 + 512
+
 def cleanup(args):
-    client = Client()
-    client.pace = args.pace
+    clients = {}
     # --app-instructions appends the stored cleanup_instructions, as the app does.
     extra = settings().get("cleanup_instructions", "") if args.app_instructions else ""
-    vocabulary = CORPUS["vocabulary"]["extended"]
-    prompt_for = (lambda case: system_prompt(CORPUS["vocabulary"]["default"], extra)) if args.vocabulary == "global" \
-        else (lambda case: system_prompt(relevant(vocabulary, case["raw"]), extra))
+    vocabulary = CORPUS["vocabulary"]["cleanup"]
+    variant = PROMPTS[args.prompt]
+    prompt_for = (lambda case: system_prompt(CORPUS["vocabulary"]["default"], extra, variant.get("text"), variant.get("label"))) \
+        if args.vocabulary == "global" \
+        else (lambda case: system_prompt(case["hints"] if "hints" in case else relevant(vocabulary, case["raw"]), extra,
+                                         variant.get("text"), variant.get("label")))
+    cases = [c for c in CORPUS["cleanup"] if not args.cases or c["id"] in args.cases]
     records = []
-    for case in CORPUS["cleanup"]:  # raw/no-cleanup baseline: 0 ms, judged on the raw text
+    for case in cases:  # raw/no-cleanup baseline: 0 ms, judged on the raw text
         records.append({"config": "raw (no cleanup)", "trial": 0, "case": case["id"], "ms": 0,
                         "output": case["raw"], "failures": judge(case, case["raw"])})
-    configs = [c for c in CLEANUP_CONFIGS if not args.only or c[0] in args.only]
+    configs = [c for c in CLEANUP_CONFIGS if not args.only or f"{c[0]}:{c[1]}:{c[2] or 'omitted'}" in args.only]
     for trial in range(args.trials):
-        for model, effort in configs:
-            name = f"{model} effort={effort or 'omitted'} vocab={args.vocabulary}"
-            for case in CORPUS["cleanup"]:
+        for path, model, effort in configs:
+            client = clients.get(path) or clients.setdefault(path, transport(path))
+            client.pace = args.pace
+            name = f"{path}:{model}:{effort or 'omitted'} prompt={args.prompt} vocab={args.vocabulary}"
+            if args.limit != "dynamic":
+                name += f" limit={args.limit}"
+            if args.temperature is not None and "gpt-oss" in model:
+                name += f" t={args.temperature:g}"
+            for case in cases:
                 body = {"model": model, "stream": False, "messages": [
                     {"role": "system", "content": prompt_for(case)},
                     {"role": "user", "content": f"<transcript>\n{case['raw']}\n</transcript>"}]}
+                if args.limit != "none":
+                    body["max_tokens"] = 4096 if args.limit == "fixed" else output_budget(case["raw"])
                 if effort:
                     body["reasoning_effort"] = effort
-                receipt, parsed = client.post("/chat/completions", json.dumps(body).encode(), "application/json")
+                if "gpt-oss" in model:
+                    body["include_reasoning"] = False
+                    if args.temperature is not None:
+                        body["temperature"] = args.temperature
+                if args.cold:
+                    client.reset()
+                receipt, parsed = client.post("/chat/completions", json.dumps(body).encode(), "application/json",
+                                              timeout=args.timeout, tries=args.tries)
                 choice = (parsed.get("choices") or [{}])[0]
                 output = (choice.get("message") or {}).get("content")
                 finish = choice.get("finish_reason")
                 failures = judge(case, output) if "error" not in receipt else [receipt["error"]]
                 if finish == "length":
                     failures.append("finish_reason=length")
+                usage = parsed.get("usage") or {}
+                if path == "router" and usage.get("prompt_tokens"):
+                    usage["prompt_tokens"] -= ROUTER_PROMPT_PAD
                 record = {"config": name, "trial": trial, "case": case["id"], **receipt, "finish": finish,
-                          "output": output, "failures": failures,
-                          "usage": parsed.get("usage")}
+                          "output": output, "failures": failures, "usage": usage}
                 records.append(record)
                 print(json.dumps({k: v for k, v in record.items() if k != "usage"}), flush=True)
+        if args.idle and trial + 1 < args.trials:
+            time.sleep(args.idle)
+            # The app's pool drops connections idle past 90 s; the router's own upstream pool also idles.
+            for client in clients.values():
+                client.reset()
     write("cleanup", records)
     report_cleanup(records)
 
+def connection(args):
+    """Cold, warm and idle-expired requests per path, on one short case. Round 0 opens a fresh
+    connection (cold); later rounds follow `--idle` seconds of silence on a fresh connection, as
+    the app's 90 s pool timeout would leave it (idle); the rest reuse the connection (warm)."""
+    variant = PROMPTS[args.prompt]
+    case = next(c for c in CORPUS["cleanup"] if c["id"] == "correction-deploy")
+    body_for = {}
+    for path, model, effort in [c for c in CLEANUP_CONFIGS if f"{c[0]}:{c[1]}:{c[2] or 'omitted'}" in args.only]:
+        body = {"model": model, "stream": False, "max_tokens": output_budget(case["raw"]), "messages": [
+            {"role": "system", "content": system_prompt(relevant(CORPUS["vocabulary"]["cleanup"], case["raw"]), "",
+                                                        variant.get("text"), variant.get("label"))},
+            {"role": "user", "content": f"<transcript>\n{case['raw']}\n</transcript>"}]}
+        if effort:
+            body["reasoning_effort"] = effort
+        if "gpt-oss" in model:
+            body.update(include_reasoning=False, temperature=0)
+        body_for[f"{path}:{model}:{effort or 'omitted'}"] = (transport(path), json.dumps(body).encode())
+    records = []
+    for round_ in range(args.rounds):
+        if round_:
+            time.sleep(args.idle)
+        for name, (client, body) in body_for.items():
+            client.reset()
+            for i in range(args.warm + 1):
+                receipt, parsed = client.post("/chat/completions", body, "application/json", timeout=15, tries=1)
+                phase = "warm" if i else ("idle" if round_ else "cold")
+                records.append({"config": name, "phase": phase, **receipt})
+                print(json.dumps(records[-1]), flush=True)
+    write("connection", records)
+    print(f"\n{'config':36} {'phase':5} {'n':>3} {'p50':>5} {'p95':>5} {'max':>5} {'err':>3}")
+    for name in body_for:
+        for phase in ("cold", "idle", "warm"):
+            group = [r for r in records if r["config"] == name and r["phase"] == phase]
+            if not group:
+                continue
+            lat = summary([r["ms"] for r in group])
+            print(f"{name:36} {phase:5} {lat['n']:>3} {lat['p50']:>5} {lat['p95']:>5} {max(r['ms'] for r in group):>5} "
+                  f"{sum(1 for r in group if 'error' in r):>3}")
+
+def cost(model, usage):
+    price = next((p for key, p in PRICES.items() if key in model), None)
+    if not price or not usage:
+        return None
+    return (usage.get("prompt_tokens", 0) * price[0] + usage.get("completion_tokens", 0) * price[1]) / 1e6
+
+KINDS = {"negation": ("negation",), "quantity": ("number", "quantity", "retries", "date"),
+         "contamination": ("prose", "answer"), "terms": ("spoken", "identifiers", "vocabulary", "muse", "commands",
+                                                         "code", "git", "literal")}
 
 def report_cleanup(records):
-    print(f"\n{'config':48} {'n':>3} {'p50':>6} {'p95':>6} {'pass':>7} {'errors':>6}  failures")
+    print(f"\n{'config':64} {'n':>3} {'p50':>5} {'p95':>5} {'ttfb50':>6} {'cold50':>6} {'warm50':>6} {'pass':>7} "
+          f"{'err':>3} {'429':>3} {'retry':>5} {'in':>5} {'out':>4} {'rsn':>4} {'$/1k':>6}")
     for name in dict.fromkeys(r["config"] for r in records):
         group = [r for r in records if r["config"] == name]
         errors = sum(1 for r in group if "error" in r)
-        # Wall time across retries; failed attempts still cost the user that time.
-        lat = summary([r.get("wall_ms", r["ms"]) for r in group])
+        limited = sum(1 for r in group if r.get("status") == 429 or r.get("attempts", 1) > 1)
+        retries = sum(r.get("attempts", 1) - 1 for r in group)
+        # Successful requests only, so a fast error never looks like fast cleanup; wall time
+        # includes any 429 waits. Errors are counted in their own column.
+        ok = [r for r in group if "error" not in r]
+        lat = summary([r.get("wall_ms", r["ms"]) for r in ok])
+        ttfb = summary([r["ttfb_ms"] for r in ok if "ttfb_ms" in r])
+        cold = summary([r["ms"] for r in ok if r.get("cold")])
+        warm = summary([r["ms"] for r in ok if r.get("cold") is False])
         passed = sum(1 for r in group if not r["failures"])
-        failed = sorted({f"{r['case']}: {'; '.join(r['failures'])}" for r in group if r["failures"]})
-        print(f"{name:48} {lat['n']:>3} {lat['p50'] or 0:>6} {lat['p95'] or 0:>6} {passed:>3}/{len(group):<3} {errors:>6}  "
-              + " | ".join(failed)[:400])
-
+        usage = [r.get("usage") or {} for r in group]
+        mean = lambda key: round(statistics.mean(u.get(key, 0) for u in usage)) if usage else 0
+        reasoning = round(statistics.mean((u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) for u in usage)) if usage else 0
+        costs = [c for c in (cost(name, u) for u in usage) if c is not None]
+        per_k = f"{statistics.mean(costs) * 1000:.3f}" if costs else "-"
+        print(f"{name:64} {lat['n']:>3} {lat['p50'] or 0:>5} {lat['p95'] or 0:>5} {ttfb['p50'] or 0:>6} {cold['p50'] or 0:>6} "
+              f"{warm['p50'] or 0:>6} {passed:>3}/{len(group):<3} {errors:>3} {limited:>3} {retries:>5} {mean('prompt_tokens'):>5} "
+              f"{mean('completion_tokens'):>4} {reasoning:>4} {per_k:>6}")
+        failed = [r for r in group if r["failures"]]
+        kinds = {k: sum(1 for r in failed if any(r["case"].startswith(p) for p in prefixes)) for k, prefixes in KINDS.items()}
+        if failed:
+            print("    by kind: " + ", ".join(f"{k}={v}" for k, v in kinds.items()))
+        for line in sorted({f"{r['case']}: {'; '.join(r['failures'])}" for r in failed}):
+            print("    " + line[:220])
 
 # ---------- app log ----------
 
@@ -565,12 +687,28 @@ def main():
     p.set_defaults(run=stt)
     p = sub.add_parser("cleanup")
     p.add_argument("--trials", type=int, default=2)
-    p.add_argument("--only", nargs="*", help="model names to include")
+    p.add_argument("--only", nargs="*", help="transport:model:effort entries to include")
+    p.add_argument("--cases", nargs="*", help="case ids to include")
+    p.add_argument("--prompt", choices=sorted(PROMPTS), default="app", help="system prompt variant (bench/prompts.json)")
+    p.add_argument("--limit", choices=["dynamic", "fixed", "none"], default="dynamic", help="max_tokens policy")
+    p.add_argument("--cold", action="store_true", help="new connection per request")
+    p.add_argument("--idle", type=float, default=0, help="seconds to sleep between trials (idle-expired pool)")
+    p.add_argument("--timeout", type=float, default=15, help="per-request timeout, as the app's cleanup_timeout_secs")
+    p.add_argument("--temperature", type=float, help="GPT-OSS sampling temperature (Haiku 5.5 rejects non-default values)")
+    p.add_argument("--tries", type=int, default=1, help="attempts on 429 (the app does not retry 429)")
     p.add_argument("--pace", type=float, default=0.0, help="seconds between requests (rate limit)")
     p.add_argument("--app-instructions", action="store_true", help="append the stored cleanup_instructions")
-    p.add_argument("--vocabulary", choices=["global", "relevant"], default="global",
+    p.add_argument("--vocabulary", choices=["global", "relevant"], default="relevant",
                    help="global: the default list for every case (old app); relevant: only mentioned terms (app now)")
     p.set_defaults(run=cleanup)
+    p = sub.add_parser("connection")
+    p.add_argument("--only", nargs="+", default=["router:claude-haiku-5-5:omitted", "groq:openai/gpt-oss-20b:low",
+                                                 "router:groq/openai/gpt-oss-20b:low"])
+    p.add_argument("--prompt", choices=sorted(PROMPTS), default="app")
+    p.add_argument("--rounds", type=int, default=6)
+    p.add_argument("--warm", type=int, default=4, help="warm requests after each cold/idle one")
+    p.add_argument("--idle", type=float, default=100, help="seconds of silence between rounds")
+    p.set_defaults(run=connection)
     p = sub.add_parser("e2e-report")
     p.add_argument("outputs", nargs="+", help="saved e2e.sh outputs")
     p.set_defaults(run=e2e_report)

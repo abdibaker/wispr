@@ -3,7 +3,8 @@
 # A temporary null sink stands in for the microphone, a uinput keyboard holds the shortcut,
 # and a GTK window receives the text. The app runs from target/debug with an isolated
 # config/data dir (your settings and history are untouched; the keyring key is reused).
-# Override settings with VP_CLEANUP_MODEL, VP_REASONING_EFFORT, VP_STT_MODEL, VP_INSERTION_METHOD, VP_LANGUAGE,
+# Override settings with VP_CLEANUP_MODEL, VP_CLEANUP_PROVIDER (router|groq), VP_CLEANUP_FALLBACK_MODEL,
+# VP_CLEANUP_INSTRUCTIONS, VP_REASONING_EFFORT, VP_STT_MODEL, VP_INSERTION_METHOD, VP_LANGUAGE,
 # VP_STREAMING (1 = live, 0 = batch only), VP_PROVIDER (deepgram|muse), VP_VOCABULARY (JSON list),
 # VP_TARGET_TITLE (window title; "main.rs - wispr" makes the target technical),
 # and the binaries with VP_DEBUG (a directory holding voice-prompt and examples/ptt).
@@ -28,8 +29,9 @@ python3 - "$home/config/voice-prompt/settings.json" <<'PY'
 import json, pathlib, sys
 user = json.loads((pathlib.Path.home() / ".config/voice-prompt/settings.json").read_text())
 import os
-for key in ("cleanup_model", "reasoning_effort", "stt_model", "insertion_method", "language"):
-    if os.environ.get("VP_" + key.upper()):
+for key in ("cleanup_model", "cleanup_provider", "cleanup_fallback_model", "cleanup_instructions",
+            "reasoning_effort", "stt_model", "insertion_method", "language"):
+    if ("VP_" + key.upper()) in os.environ:
         user[key] = os.environ["VP_" + key.upper()]
 if os.environ.get("VP_STREAMING"):
     user["streaming"] = os.environ["VP_STREAMING"] == "1"
