@@ -41,6 +41,9 @@ pub const MUSE_MODEL: &str = "muse-voice-transcribe-1.0";
 const MUSE_MAX_LEAD: Duration = Duration::from_secs(3);
 /// Nova-3 accepts up to 100 keyterms within 500 tokens; identifiers tokenize densely.
 const MAX_KEYTERMS: usize = 50;
+/// Muse fails the whole session (`provider_error`) on a keyword over 20 characters
+/// (measured 2026-10), so longer terms are skipped rather than sent.
+const MUSE_MAX_KEYWORD_CHARS: usize = 20;
 /// Deepgram's flush after CloseStream normally takes a few hundred ms; past this the
 /// session is untrusted and the retained recording goes to batch STT.
 const FINALIZE_DEADLINE: Duration = Duration::from_secs(3);
@@ -569,6 +572,7 @@ fn muse_config(language: Option<&str>, keyterms: &[String]) -> serde_json::Value
     });
     let keywords: Vec<&str> = crate::settings::vocabulary_terms(keyterms)
         .into_iter()
+        .filter(|t| t.chars().count() <= MUSE_MAX_KEYWORD_CHARS)
         .take(MAX_KEYTERMS)
         .collect();
     if !keywords.is_empty() {
@@ -1264,9 +1268,15 @@ mod tests {
         let auto = muse_config(Some("auto"), &[]);
         assert!(auto.get("languageBias").is_none());
         assert!(muse_config(None, &[]).get("languageBias").is_none());
-        let terms: Vec<String> = ["9Router", "T3 Code", "pnpm", "9router"]
-            .map(String::from)
-            .to_vec();
+        let terms: Vec<String> = [
+            "9Router",
+            "T3 Code",
+            "whisper-large-v3-turbo",
+            "pnpm",
+            "9router",
+        ]
+        .map(String::from)
+        .to_vec();
         assert_eq!(
             muse_config(Some("en"), &terms)["keywords"],
             serde_json::json!(["9Router", "T3 Code", "pnpm"])
