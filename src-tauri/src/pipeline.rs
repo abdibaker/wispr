@@ -794,7 +794,10 @@ mod tests {
             })
         });
         let pipeline = Pipeline::new(history, connect, Arc::new(desktop));
-        pipeline.run(&snapshot, recording(None), |_| {}).await.unwrap();
+        pipeline
+            .run(&snapshot, recording(None), |_| {})
+            .await
+            .unwrap();
         let latency = pipeline.last_latency.lock().unwrap().clone().unwrap();
         // Not counted as a preferred-model success.
         assert_eq!(latency.outcome, "cleaned_fallback");

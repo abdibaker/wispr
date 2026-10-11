@@ -52,6 +52,8 @@ pub struct Settings {
 #[serde(rename_all = "lowercase")]
 pub enum StreamingProvider {
     Muse,
+    /// Experimental: ElevenLabs Scribe v2 Realtime.
+    Scribe,
     /// Also any unknown value, as before typed settings.
     #[serde(other)]
     Deepgram,
@@ -487,7 +489,10 @@ mod tests {
         assert!(relevant_terms(&vocabulary, "Don't log the request body.").is_empty());
         // Muse spells digits out and joins file names.
         assert_eq!(
-            relevant_terms(&vocabulary, "Bump Cargotoml and route it through nine router."),
+            relevant_terms(
+                &vocabulary,
+                "Bump Cargotoml and route it through nine router."
+            ),
             ["9Router", "Cargo.toml"]
         );
     }

@@ -566,7 +566,10 @@ mod tests {
     /// recording the request bodies. `None` never answers (a hung provider).
     async fn server(
         responses: Vec<Option<(u16, serde_json::Value)>>,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -586,14 +589,20 @@ mod tests {
                     };
                     let length = head
                         .lines()
-                        .find_map(|l| l.to_lowercase().strip_prefix("content-length: ").map(String::from))
+                        .find_map(|l| {
+                            l.to_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(String::from)
+                        })
                         .and_then(|l| l.trim().parse::<usize>().ok())
                         .unwrap_or(0);
                     if body.len() >= length {
                         break body.to_string();
                     }
                 };
-                seen.lock().unwrap().push(serde_json::from_str(&body).unwrap());
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&body).unwrap());
                 let Some((status, json)) = response else {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     continue;
@@ -630,14 +639,18 @@ mod tests {
 
     #[tokio::test]
     async fn gpt_oss_requests_are_bounded_and_hide_reasoning() {
-        let (url, bodies) = server(vec![Some((200, completion("Deploy on Monday.", "stop")))]).await;
+        let (url, bodies) =
+            server(vec![Some((200, completion("Deploy on Monday.", "stop")))]).await;
         let raw = "Deploy tomorrow, no, change that to Monday.";
         let cleaned = cleaner(&url, "openai/gpt-oss-20b", "groq_direct")
             .clean(raw, &["9Router".into()], "")
             .await
             .unwrap();
         assert_eq!(cleaned.text, "Deploy on Monday.");
-        assert_eq!((cleaned.provider, cleaned.fallback_reason), ("groq_direct", None));
+        assert_eq!(
+            (cleaned.provider, cleaned.fallback_reason),
+            ("groq_direct", None)
+        );
         let body = &bodies.lock().unwrap()[0];
         assert_eq!(body["model"], "openai/gpt-oss-20b");
         assert_eq!(body["reasoning_effort"], "low");
@@ -645,13 +658,19 @@ mod tests {
         assert_eq!(body["temperature"], 0);
         assert_eq!(body["stream"], false);
         assert_eq!(body["max_tokens"], output_budget(raw));
-        assert!(body["messages"][0]["content"].as_str().unwrap().ends_with("Spelling hints: 9Router"));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Spelling hints: 9Router"));
     }
 
     #[tokio::test]
     async fn haiku_requests_carry_no_gpt_oss_fields() {
         let (url, bodies) = server(vec![Some((200, completion("Fix it.", "stop")))]).await;
-        cleaner(&url, "claude-haiku-5-5", "9router").clean("fix it", &[], "").await.unwrap();
+        cleaner(&url, "claude-haiku-5-5", "9router")
+            .clean("fix it", &[], "")
+            .await
+            .unwrap();
         let body = &bodies.lock().unwrap()[0];
         for field in ["reasoning_effort", "include_reasoning", "temperature"] {
             assert!(body.get(field).is_none(), "{field}");
@@ -671,7 +690,10 @@ mod tests {
         let (groq, _) = server(vec![Some((429, serde_json::json!({"error": "rate"})))]).await;
         let (router, bodies) = server(vec![Some((200, completion("Fixed.", "stop")))]).await;
         let started = Instant::now();
-        let cleaned = fallback(&groq, &router).clean("fix", &[], "").await.unwrap();
+        let cleaned = fallback(&groq, &router)
+            .clean("fix", &[], "")
+            .await
+            .unwrap();
         // No retry-after wait or backoff before the fallback (Groq advertises seconds).
         assert!(started.elapsed() < Duration::from_secs(2), "no retry wait");
         assert_eq!(cleaned.text, "Fixed.");
@@ -693,7 +715,10 @@ mod tests {
         ] {
             let (groq, _) = server(vec![response]).await;
             let (router, _) = server(vec![Some((200, completion("Fixed.", "stop")))]).await;
-            let cleaned = fallback(&groq, &router).clean("fix", &[], "").await.unwrap();
+            let cleaned = fallback(&groq, &router)
+                .clean("fix", &[], "")
+                .await
+                .unwrap();
             assert_eq!(cleaned.fallback_reason, Some(reason));
             assert_eq!(cleaned.text, "Fixed.");
             assert!(cleaned.failed_ms > 0 || reason != "timeout");
@@ -715,7 +740,10 @@ mod tests {
         let (groq, _) = server(vec![Some((429, serde_json::json!({})))]).await;
         let (router, _) = server(vec![Some((429, serde_json::json!({})))]).await;
         let result = fallback(&groq, &router).clean("fix", &[], "").await;
-        assert_eq!(Failure::of(&result.err().unwrap()), Some(Failure::RateLimited));
+        assert_eq!(
+            Failure::of(&result.err().unwrap()),
+            Some(Failure::RateLimited)
+        );
     }
 
     #[tokio::test]
@@ -724,7 +752,10 @@ mod tests {
         let closed = format!("http://{}", unused.local_addr().unwrap());
         drop(unused);
         let (router, _) = server(vec![Some((200, completion("Fixed.", "stop")))]).await;
-        let cleaned = fallback(&closed, &router).clean("fix", &[], "").await.unwrap();
+        let cleaned = fallback(&closed, &router)
+            .clean("fix", &[], "")
+            .await
+            .unwrap();
         assert_eq!(cleaned.fallback_reason, Some("network"));
     }
 
@@ -737,10 +768,21 @@ mod tests {
             ..Default::default()
         };
         // The default routes through 9Router even when a Groq key exists.
-        let routed = connect(reqwest::Client::new(), &settings, "k".into(), Some("g".into()));
+        let routed = connect(
+            reqwest::Client::new(),
+            &settings,
+            "k".into(),
+            Some("g".into()),
+        );
         let cleaned = routed.cleaner.clean("x", &[], "").await.unwrap();
-        assert_eq!((cleaned.provider, cleaned.text.as_str()), ("9router", "Routed."));
-        assert_eq!(router.lock().unwrap()[0]["model"], "groq/openai/gpt-oss-20b");
+        assert_eq!(
+            (cleaned.provider, cleaned.text.as_str()),
+            ("9router", "Routed.")
+        );
+        assert_eq!(
+            router.lock().unwrap()[0]["model"],
+            "groq/openai/gpt-oss-20b"
+        );
         // Groq selected but no key saved: still 9Router, so dictation keeps working.
         let (router_url, router) = server(vec![Some((200, completion("Routed.", "stop")))]).await;
         let keyless = Settings {
@@ -753,8 +795,14 @@ mod tests {
             ..keyless
         };
         let routed = connect(reqwest::Client::new(), &keyless, "k".into(), None);
-        assert_eq!(routed.cleaner.clean("x", &[], "").await.unwrap().provider, "9router");
-        assert_eq!(router.lock().unwrap()[0]["model"], "groq/openai/gpt-oss-20b");
+        assert_eq!(
+            routed.cleaner.clean("x", &[], "").await.unwrap().provider,
+            "9router"
+        );
+        assert_eq!(
+            router.lock().unwrap()[0]["model"],
+            "groq/openai/gpt-oss-20b"
+        );
     }
 
     #[test]
