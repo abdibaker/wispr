@@ -1,34 +1,28 @@
 #!/usr/bin/env python3
-"""Reproducible STT and cleanup benchmarks. See bench/README.md.
+"""Regression checks for the production stack. See bench/README.md.
 
-  python3 bench/run.py cleanup [--suite smoke]    # stored transcripts -> cleanup -> evaluator
-  python3 bench/run.py stt-live [--provider muse] # fixed audio -> live STT, no cleanup
+  python3 bench/run.py cleanup [--suite smoke]    # stored transcripts -> Haiku -> evaluator
+  python3 bench/run.py stt                        # fixed audio -> Muse, no cleanup
   python3 bench/run.py record                     # record the author's core STT clips
-  python3 bench/run.py synth                      # (re)generate synthetic clips
-  python3 bench/run.py stt [--trials 3]           # batch Whisper models x vocabulary hints
-  python3 bench/run.py latency LOG                # p50/p95 per stage from voice-prompt.log
+  python3 bench/run.py latency [LOG]              # p50/p95 per stage from voice-prompt.log
   python3 bench/run.py e2e-report OUT...          # raw/cleaned accuracy and latency from e2e.sh
 
 Reads endpoint from ~/.config/voice-prompt/settings.json and the key from the keyring
-(or $VP_KEY). Writes JSON results under bench/results/. Stdlib only.
+(or $VP_KEY). Writes JSON results under bench/results/ (gitignored). Stdlib only.
 """
-import argparse, concurrent.futures, ctypes, functools, hashlib, http.client, json, os, pathlib, re, signal, ssl, statistics
-import subprocess, sys, tempfile, threading, time, urllib.parse, uuid, wave
+import argparse, concurrent.futures, functools, hashlib, http.client, json, os, pathlib, re, signal, ssl, statistics
+import subprocess, sys, threading, time, urllib.parse, wave
 from evaluate import evaluate, has_span
+
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 CORPUS = json.loads((HERE / "corpus.json").read_text())
 RESULTS = HERE / "results"
 
-STT_MODELS = ["groq/whisper-large-v3-turbo", "groq/whisper-large-v3"]
-# Prose clips whose transcripts must not gain vocabulary terms.
-CONTAMINATION = ["Codex", "T3 Code", "Claude Code", "9Router", "TanStack", "Tailscale", "Coolify", "shadcn"]
-GROQ_URL = "https://api.groq.com/openai/v1"
 # 9Router otherwise prepends its own style prompt to the system message.
 ROUTER_HEADERS = {"x-9router-token-saver": "off"}
-# 9Router adds a fixed buffer to reported prompt tokens; subtracted so paths compare.
-ROUTER_PROMPT_PAD = 2000
+
 
 def settings():
     return json.loads((pathlib.Path.home() / ".config/voice-prompt/settings.json").read_text())
@@ -51,8 +45,6 @@ class Client:
         self.key = key or credential()
         self.headers = headers or {}
         self.conn = None
-        self.pace = 0.0
-        self.last = 0.0
 
     def reset(self):
         if self.conn:
@@ -60,14 +52,10 @@ class Client:
         self.conn = None
 
     def post(self, path, body, content_type, timeout=60, tries=4):
-        """Paced and retried on 429: Groq allows 20 requests/minute per Whisper model.
-        `wall_ms` covers every attempt and wait, so retried rows are not reported as fast."""
-        started = None
+        """Retried on 429. `wall_ms` covers every attempt and wait, so retried rows are not
+        reported as fast."""
+        started = time.perf_counter()
         for attempt in range(tries):
-            if self.pace:
-                time.sleep(max(0, self.last + self.pace - time.monotonic()))
-            started = started or time.perf_counter()  # pacing before the first attempt is ours, not the user's
-            self.last = time.monotonic()
             out, parsed = self._post(path, body, content_type, timeout)
             if out.get("status") != 429 or attempt + 1 == tries:
                 break
@@ -110,61 +98,12 @@ def ms(since):
     return round((time.perf_counter() - since) * 1000)
 
 
-# ---------- synthetic audio ----------
-
-def espeak(text, path):
-    lib = ctypes.CDLL("libespeak-ng.so.1")
-    rate = lib.espeak_Initialize(2, 0, None, 0)  # AUDIO_OUTPUT_SYNCHRONOUS
-    chunks = []
-    callback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_short), ctypes.c_int, ctypes.c_void_p)
-    callback = callback_type(lambda wav, n, _: chunks.append(ctypes.string_at(wav, n * 2)) or 0 if wav and n > 0 else 0)
-    lib.espeak_SetSynthCallback(callback)
-    lib.espeak_SetVoiceByName(b"en-us")
-    lib.espeak_SetParameter(1, 160, 0)  # words per minute
-    data = text.encode()
-    lib.espeak_Synth(data, len(data) + 1, 0, 0, 0, 0, None, None)
-    lib.espeak_Synchronize()
-    with tempfile.NamedTemporaryFile(suffix=".wav") as raw:
-        with wave.open(raw.name, "wb") as out:
-            out.setnchannels(1), out.setsampwidth(2), out.setframerate(rate)
-            out.writeframes(b"".join(chunks))
-        # The app records 16 kHz mono; pad 300 ms of silence like a real push-to-talk clip.
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", raw.name, "-af", "adelay=300,apad=pad_dur=0.3",
-                        "-ar", "16000", "-ac", "1", str(path)], check=True)
-
-
-def neural(text, voice, path):
-    """Neural TTS (edge-tts through 9Router): closer to human speech than espeak, still synthetic."""
-    client = Client()
-    out, _ = client.post("/audio/speech", json.dumps({"model": f"edge-tts/{voice}", "input": text}).encode(),
-                         "application/json")
-    if out.get("status") != 200:
-        sys.exit(f"TTS failed: {out}")
-    with tempfile.NamedTemporaryFile(suffix=".mp3") as mp3:
-        mp3.write(client.body)
-        mp3.flush()
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", mp3.name, "-af", "adelay=300,apad=pad_dur=0.3",
-                        "-ar", "16000", "-ac", "1", str(path)], check=True)
-
-def synth(_args):
-    for case in CORPUS["stt"]:
-        path = audio_path(case)
-        if "speak" in case:
-            espeak(case["speak"], path)
-        elif "voice" in case:
-            if path.exists():
-                continue
-            neural(case["say"], case["voice"], path)
-        else:
-            continue
-        print("wrote", path.relative_to(ROOT))
-
-
 def audio_path(case):
     return HERE / (case.get("audio") or f"audio/{case['id']}.wav")
 
 
 # ---------- scoring ----------
+
 
 def words(text):
     text = text.lower().replace("'", "")
@@ -210,84 +149,6 @@ def summary(values):
 
 # ---------- STT ----------
 
-def multipart(audio, fields):
-    boundary = uuid.uuid4().hex
-    parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
-             for k, v in fields.items()]
-    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
-                 f'Content-Type: audio/wav\r\n\r\n'.encode() + audio + b"\r\n")
-    parts.append(f"--{boundary}--\r\n".encode())
-    return b"".join(parts), "multipart/form-data; boundary=" + boundary
-
-
-def hint(vocabulary):
-    """Mirror of settings::vocabulary_hint (400-character budget, first terms win)."""
-    out, seen = "", set()
-    for term in (t.strip() for t in vocabulary):
-        if not term or term.lower() in seen:
-            continue
-        seen.add(term.lower())
-        candidate = term if not out else out + ", " + term
-        if len(candidate) > 400:
-            break
-        out = candidate
-    return out
-
-
-def stt(args):
-    client = Client()
-    client.pace = args.pace
-    hints = {"none": "", "default": hint(CORPUS["vocabulary"]["default"]),
-             "extended": hint(CORPUS["vocabulary"]["extended"])}
-    # "contextual": the app sends the extended hint only into technical windows (editor,
-    # terminal, file in the title); prose clips stand for dictation elsewhere and get none.
-    records = []
-    for trial in range(args.trials):
-        for case in [c for c in CORPUS["stt"] if audio_path(c).exists()]:
-            audio = audio_path(case).read_bytes()
-            for model in args.models:
-                for hint_name in args.hints:
-                    fields = {"model": model, "response_format": "json", "language": "en"}
-                    text_hint = (hints["extended"] if case["id"].startswith("tech") else "") \
-                        if hint_name == "contextual" else hints[hint_name]
-                    if text_hint:
-                        fields["prompt"] = text_hint
-                    if args.cold:
-                        client.reset()
-                    receipt, parsed = client.post("/audio/transcriptions", *multipart(audio, fields))
-                    text = (parsed.get("text") or "").strip()
-                    record = {"trial": trial, "case": case["id"], "synthetic": case["synthetic"], "model": model,
-                              "hint": hint_name, **receipt, "text": text}
-                    if "error" not in receipt:
-                        record["wer"] = round(wer(case["reference"], text), 3)
-                        if not case["id"].startswith("tech"):
-                            record["contaminated"] = [t for t in CONTAMINATION if contains(text, t, case=False)]
-                        record["terms"] = f"{len(term_hits(case['terms'], text))}/{len(case['terms'])}"
-                    records.append(record)
-                    print(json.dumps(record), flush=True)
-    write("stt", records)
-    report_stt(records)
-
-
-def report_stt(records):
-    ok = [r for r in records if "error" not in r]
-    print(f"\n{'model':32} {'hint':10} {'n':>3} {'p50':>6} {'p95':>6} {'WER real':>9} {'WER synth':>9} {'terms':>7} {'errors':>6} {'contam':>6}")
-    for model in dict.fromkeys(r["model"] for r in records):
-        for hint_name in sorted({r["hint"] for r in records}):
-            group = [r for r in ok if r["model"] == model and r["hint"] == hint_name]
-            errors = sum(1 for r in records if r["model"] == model and r["hint"] == hint_name and "error" in r)
-            if not group:
-                continue
-            real = [r["wer"] for r in group if not r["synthetic"]]
-            synth_ = [r["wer"] for r in group if r["synthetic"]]
-            hit = sum(int(r["terms"].split("/")[0]) for r in group)
-            total = sum(int(r["terms"].split("/")[1]) for r in group)
-            lat = summary([r["ms"] for r in group])
-            contaminated = sum(1 for r in group if r.get("contaminated"))
-            print(f"{model:32} {hint_name:10} {lat['n']:>3} {lat['p50']:>6} {lat['p95']:>6} "
-                  f"{statistics.mean(real) if real else 0:>9.3f} {statistics.mean(synth_) if synth_ else 0:>9.3f} "
-                  f"{hit:>3}/{total:<3} {errors:>6} {contaminated:>6}")
-
 
 def stt_cases(args):
     cases = [c for c in CORPUS["stt"] if (args.kind is None or c["kind"] in args.kind)
@@ -304,6 +165,7 @@ def stt_cases(args):
 
 COMMANDS = {"git status", "pnpm check", "pnpm install", "cargo test"}
 
+
 def term_kind(term):
     """Scoring category of a reference term; a term may be only one."""
     if term in COMMANDS:
@@ -318,6 +180,7 @@ def term_kind(term):
     if any(ch.isdigit() for ch in term) or term in ("three retries",):
         return "number"
     return "term"
+
 
 def command_shape(term, text):
     """How a command or path came out: exact, case (only letter case differs), spoken
@@ -334,10 +197,11 @@ def command_shape(term, text):
     got = [p for p in parts if p in words(text) or p in heard]
     return "partial" if got else "missing"
 
-def stt_live(args):
-    """Fixed audio -> live STT through the app's own streaming code (examples/stt.rs), at real
+
+def stt(args):
+    """Fixed audio -> Muse through the app's own streaming code (examples/stt.rs), at real
     time, no cleanup. Latency: `first_partial` from the first audio sent, `release_to_final`
-    from the last chunk to the provider's confirmed final transcript."""
+    from the last chunk to Muse's confirmed final transcript."""
     cases = stt_cases(args)
     if not cases:
         sys.exit("no recorded clips match")
@@ -350,18 +214,15 @@ def stt_live(args):
             # The app sends keyterms only into technical windows; the core corpus is mixed.
             terms = CORPUS["vocabulary"]["extended"] if args.keyterms and case["terms"] else []
             jobs.append({"id": f"{case['id']}#{trial}", "audio": str(audio_path(case)), "keyterms": terms})
-    env = dict(os.environ, STT_LANGUAGE=args.language or settings().get("language", "en"),
-               SCRIBE_CHUNK_MS=str(args.chunk_ms))
-    out = subprocess.run([str(binary), args.provider, str(args.concurrency)], input=json.dumps(jobs),
-                         capture_output=True, text=True, timeout=900, env=env)
+    out = subprocess.run([str(binary), str(args.concurrency)], input=json.dumps(jobs),
+                         capture_output=True, text=True, timeout=900)
     by_id = {c["id"]: c for c in cases}
-    label = args.label or "-".join([args.provider] + (["keyterms"] if args.keyterms else []))
+    label = "muse-keyterms" if args.keyterms else "muse"
     records = []
     for line in out.stdout.splitlines():
         r = json.loads(line)
         case = by_id[r["id"].split("#")[0]]
-        r.update(case=case["id"], kind=case["kind"], provider=label, language=env["STT_LANGUAGE"],
-                 chunk_ms=args.chunk_ms if args.provider == "scribe" else None)
+        r.update(case=case["id"], kind=case["kind"], provider=label)
         if r.get("text") is not None:
             r["wer"] = round(wer(case["reference"], r["text"]), 3)
             # Accuracy: the term was heard ("three" counts for "3"). Format: written exactly.
@@ -376,9 +237,10 @@ def stt_live(args):
     if out.returncode:
         print(out.stderr[-2000:], file=sys.stderr)
     write(f"stt-{label}", records)
-    report_stt_live(records, cases)
+    report_stt(records, cases)
 
-def report_stt_live(records, cases):
+
+def report_stt(records, cases):
     """Real voice and synthetic speech never share a row. Per category, `heard/exact/total`:
     heard ignores case and number spelling, exact is the written form."""
     kinds = ("term", "command", "path", "model", "number")
@@ -420,6 +282,7 @@ def report_stt_live(records, cases):
         if r.get("misformatted") or (r.get("wer") or 0) > 0.15:
             print(f"  {r['case']}: WER {r['wer']}, missed {r['missed']}, format {sorted(set(r['misformatted']) - set(r['missed']))}: {r['text'][:120]}")
 
+
 def cut_off(path):
     """True when the clip ends in speech: the last 200 ms are well above the room's noise floor.
     ponytail: energy heuristic; misses a clip cut during a soft consonant."""
@@ -455,6 +318,7 @@ def record(args):
 
 # ---------- cleanup ----------
 
+
 @functools.cache
 def app_prompt():
     """CLEANUP_SYSTEM_PROMPT from providers.rs."""
@@ -462,14 +326,13 @@ def app_prompt():
     prompt = source.split('pub const CLEANUP_SYSTEM_PROMPT: &str = "', 1)[1].split('";\n', 1)[0]
     return prompt.replace("\\\n", "").replace('\\"', '"')
 
-def system_prompt(vocabulary, extra="", prompt=None, label=None):
+
+def system_prompt(vocabulary, prompt):
     """Mirror of OpenAiCompatible::clean's system message."""
-    prompt = prompt or app_prompt()
     if vocabulary:
-        prompt += f"\n{label or VOCABULARY_LABEL}: " + ", ".join(vocabulary)
-    if extra.strip():
-        prompt += "\nAdditional user preferences: " + extra.strip()
+        prompt += "\nSpelling hints: " + ", ".join(vocabulary)
     return prompt
+
 
 def squash(text):
     return "".join(c for c in text.lower() if c.isalnum())
@@ -514,39 +377,23 @@ def relevant(vocabulary, transcript, limit=24):
             out.append(term)
     return out[:limit]
 
-
-VOCABULARY_LABEL = "Spelling hints"
-# Candidate prompts, selected with --prompt; "app" is CLEANUP_SYSTEM_PROMPT. "label" names the
-# term list appended to the system message.
+# Candidate prompts, selected with --prompt; "app" is CLEANUP_SYSTEM_PROMPT.
 PROMPTS = {"app": {}}
 PROMPTS_FILE = HERE / "prompts.json"
 if PROMPTS_FILE.exists():
-    PROMPTS.update(json.loads(PROMPTS_FILE.read_text()))
+    PROMPTS.update((k, v) for k, v in json.loads(PROMPTS_FILE.read_text()).items() if not k.startswith("_"))
 
-# name: (base URL or None for the app's 9Router endpoint, keyring account, env override, headers).
-# A new OpenAI-compatible provider (Cerebras) is one line here plus a PROVIDERS entry.
-TRANSPORTS = {
-    "router": (None, "9router-api-key", "VP_KEY", ROUTER_HEADERS),
-    "groq": (GROQ_URL, "groq-api-key", "VP_GROQ_KEY", {}),
-}
-# --provider name: (transport, model, reasoning_effort). "" omits the field, as the app does for "none".
-PROVIDERS = {
-    "groq-20b": ("groq", "openai/gpt-oss-20b", "low"),
-    "router-20b": ("router", "groq/openai/gpt-oss-20b", "low"),
-    "router-haiku": ("router", "claude-haiku-5-5", ""),
-    "haiku-off": ("router", "claude-haiku-5-5", "none"),
-    "haiku-low": ("router", "claude-haiku-5-5", "low"),
-    "haiku-medium": ("router", "claude-haiku-5-5", "medium"),
-    "groq-120b": ("groq", "openai/gpt-oss-120b", "low"),
-}
 
-def transport(name):
-    url, account, env, headers = TRANSPORTS[name]
-    return Client(url, credential(account, env), headers)
+MODEL = "claude-haiku-5-5"
+# --effort: 9Router's reasoning_effort. "none" is Anthropic's thinking: disabled (the app's);
+# the others are adaptive thinking at that effort.
+EFFORTS = ["none", "low", "medium"]
+
 
 def output_budget(raw):
     """Mirror of providers::output_budget."""
     return len(raw.encode()) // 2 + 512
+
 
 CASES = HERE / "cleanup.json"
 LOCAL_CASES = HERE / "cleanup.local.json"  # private dictations, gitignored
@@ -556,14 +403,12 @@ SUITES = {"smoke": lambda c: c.get("smoke"), "dev": lambda c: c["suite"] == "dev
 
 
 def prompt_text(name):
-    variant = PROMPTS[name]
-    return variant.get("text") or app_prompt(), variant.get("label") or VOCABULARY_LABEL
+    return PROMPTS[name].get("text") or app_prompt()
 
 
 @functools.cache
 def prompt_hash(name):
-    text, label = prompt_text(name)
-    return hashlib.sha256(f"{text}\n{label}".encode()).hexdigest()[:10]
+    return hashlib.sha256(prompt_text(name).encode()).hexdigest()[:10]
 
 
 def select(args):
@@ -579,41 +424,35 @@ def select(args):
     return corpus["vocabulary"], cases
 
 
-def request(case, vocabulary, prompt, model, effort):
+def request(case, vocabulary, prompt, effort):
     """The app's request body (OpenAiCompatible::clean) for one case."""
-    text, label = prompt_text(prompt)
     hints = case["hints"] if "hints" in case else relevant_terms(tuple(vocabulary), case["input"])
-    body = {"model": model, "stream": False, "max_tokens": output_budget(case["input"]), "messages": [
-        {"role": "system", "content": system_prompt(hints, "", text, label)},
-        {"role": "user", "content": f"<transcript>\n{case['input']}\n</transcript>"}]}
-    if effort:
-        body["reasoning_effort"] = effort
-    if "gpt-oss" in model:
-        body.update(include_reasoning=False, temperature=0)
-    return body
+    return {"model": MODEL, "stream": False, "max_tokens": output_budget(case["input"]),
+            "reasoning_effort": effort, "messages": [
+                {"role": "system", "content": system_prompt(hints, prompt_text(prompt))},
+                {"role": "user", "content": f"<transcript>\n{case['input']}\n</transcript>"}]}
 
 
 def cleanup(args):
-    """Stored transcript -> cleanup provider -> deterministic evaluator. No audio, no app.
+    """Stored transcript -> Haiku -> deterministic evaluator. No audio, no app.
 
     Requests run concurrently (one keep-alive connection per worker thread). Outputs are cached
-    under bench/.cache keyed by the full request body, transport and trial, so a changed prompt,
-    model, effort or hint list never reuses an old output; --fresh bypasses the cache."""
+    under bench/.cache keyed by the full request body and trial, so a changed prompt, effort or
+    hint list never reuses an old output; --fresh bypasses the cache."""
     vocabulary, cases = select(args)
     for case in cases:  # outside the pool: pure-Python matching holds the GIL
         relevant_terms(tuple(vocabulary), case["input"])
-    jobs = [(provider, prompt, case, trial) for provider in args.provider for prompt in args.prompt
+    jobs = [(effort, prompt, case, trial) for effort in args.effort for prompt in args.prompt
             for trial in range(args.trials) for case in cases]
     local = threading.local()
     stop = threading.Event()
 
     def run(job):
-        provider, prompt, case, trial = job
-        path, model, effort = PROVIDERS[provider]
-        body = request(case, vocabulary, prompt, model, effort)
-        key = hashlib.sha256(json.dumps([TRANSPORTS[path][0], body, trial], sort_keys=True).encode()).hexdigest()
+        effort, prompt, case, trial = job
+        body = request(case, vocabulary, prompt, effort)
+        key = hashlib.sha256(json.dumps([None, body, trial], sort_keys=True).encode()).hexdigest()
         cached = CACHE / f"{key}.json"
-        record = {"provider": provider, "model": model, "effort": effort, "prompt": prompt,
+        record = {"effort": effort, "prompt": prompt,
                   "prompt_hash": prompt_hash(prompt), "trial": trial, "case": case["id"], "suite": case["suite"],
                   "category": case["category"], "source": case["source"]}
         if stop.is_set():
@@ -621,8 +460,9 @@ def cleanup(args):
         if cached.exists() and not args.fresh:
             record.update(json.loads(cached.read_text()), cached=True)
         else:
-            clients = local.__dict__.setdefault("clients", {})
-            client = clients.get(path) or clients.setdefault(path, transport(path))
+            if not hasattr(local, "client"):
+                local.client = Client(headers=ROUTER_HEADERS)
+            client = local.client
             receipt, parsed = client.post("/chat/completions", json.dumps(body).encode(), "application/json",
                                           timeout=args.timeout, tries=1)
             choice = (parsed.get("choices") or [{}])[0]
@@ -650,7 +490,7 @@ def cleanup(args):
         records = [r for r in pool.map(run, jobs) if r]
     elapsed = time.perf_counter() - started
     if not args.quiet:
-        keep = ("provider", "model", "effort", "prompt", "prompt_hash", "trial", "case", "suite", "cached",
+        keep = ("effort", "prompt", "prompt_hash", "trial", "case", "suite", "cached",
                 "wall_ms", "status", "error", "finish", "output", "verdict")
         write("cleanup", [{k: r[k] for k in keep if k in r} for r in records])
     report_cleanup(records, cases, args.verbose)
@@ -659,52 +499,20 @@ def cleanup(args):
     if any(r["verdict"]["hard"] for r in records):
         sys.exit(1)
 
-def connection(args):
-    """Cold, warm and idle-expired requests per path, on one short case. Round 0 opens a fresh
-    connection (cold); later rounds follow `--idle` seconds of silence on a fresh connection, as
-    the app's 90 s pool timeout would leave it (idle); the rest reuse the connection (warm)."""
-    corpus = json.loads(CASES.read_text())
-    case = next(c for c in corpus["cases"] if c["id"] == "correction-deploy")
-    body_for = {}
-    for provider in args.provider:
-        path, model, effort = PROVIDERS[provider]
-        body = request(case, corpus["vocabulary"], args.prompt, model, effort)
-        body_for[provider] = (transport(path), json.dumps(body).encode())
-    records = []
-    for round_ in range(args.rounds):
-        if round_:
-            time.sleep(args.idle)
-        for name, (client, body) in body_for.items():
-            client.reset()
-            for i in range(args.warm + 1):
-                receipt, parsed = client.post("/chat/completions", body, "application/json", timeout=15, tries=1)
-                phase = "warm" if i else ("idle" if round_ else "cold")
-                records.append({"config": name, "phase": phase, **receipt})
-                print(json.dumps(records[-1]), flush=True)
-    write("connection", records)
-    print(f"\n{'config':36} {'phase':5} {'n':>3} {'p50':>5} {'p95':>5} {'max':>5} {'err':>3}")
-    for name in body_for:
-        for phase in ("cold", "idle", "warm"):
-            group = [r for r in records if r["config"] == name and r["phase"] == phase]
-            if not group:
-                continue
-            lat = summary([r["ms"] for r in group])
-            print(f"{name:36} {phase:5} {lat['n']:>3} {lat['p50']:>5} {lat['p95']:>5} {max(r['ms'] for r in group):>5} "
-                  f"{sum(1 for r in group if 'error' in r):>3}")
 
 HARD = ["lost", "negation", "quantity", "question", "superseded", "answered", "invented", "literal", "empty", "provider"]
 
 
 def report_cleanup(records, cases, verbose=False):
-    """Per provider x prompt: semantic pass (no hard failure) first, then clean (no soft
+    """Per effort x prompt: semantic pass (no hard failure) first, then clean (no soft
     failure either), then latency over uncached calls only."""
     by_id = {c["id"]: c for c in cases}
     groups = {}
     for r in records:
-        groups.setdefault((r["provider"], r["prompt"], r["prompt_hash"]), []).append(r)
-    print(f"\n{'provider':13} {'prompt':10} {'hash':10} {'suite':8} {'n':>3} {'semantic':>9} {'clean':>7} "
+        groups.setdefault((r["effort"], r["prompt"], r["prompt_hash"]), []).append(r)
+    print(f"\n{'effort':13} {'prompt':10} {'hash':10} {'suite':8} {'n':>3} {'semantic':>9} {'clean':>7} "
           f"{'exact':>5} {'p50':>5} {'p95':>5} {'err':>3}  hard failures by type")
-    for (provider, prompt, hash_), group in groups.items():
+    for (effort, prompt, hash_), group in groups.items():
         for suite in ("dev", "holdout"):
             rows = [r for r in group if r["suite"] == suite]
             if not rows:
@@ -717,7 +525,7 @@ def report_cleanup(records, cases, verbose=False):
             for r in hard:
                 for kind, _ in r["verdict"]["hard"]:
                     types[kind] = types.get(kind, 0) + 1
-            print(f"{provider:13} {prompt:10} {hash_:10} {suite:8} {len(rows):>3} "
+            print(f"{effort:13} {prompt:10} {hash_:10} {suite:8} {len(rows):>3} "
                   f"{len(rows) - len(hard):>4}/{len(rows):<4} {len(clean):>3}/{len(rows):<3} "
                   f"{sum(1 for r in rows if r['verdict'].get('exact')):>5} {lat['p50'] or '-':>5} {lat['p95'] or '-':>5} "
                   f"{sum(1 for r in rows if 'error' in r):>3}  "
@@ -736,7 +544,9 @@ def report_cleanup(records, cases, verbose=False):
                 print(f"         in:  {by_id[r['case']]['input'][:150]}")
                 print(f"         out: {(r.get('output') or '')[:150]}")
 
+
 # ---------- app log ----------
+
 
 def latency(args):
     rows, labels = [], []
@@ -794,6 +604,7 @@ def alignment(reference, hypothesis):
             ins.append(h[j - 1])
             j -= 1
     return subs, dels, ins
+
 
 def e2e_report(args):
     """Raw and cleaned accuracy plus stage latency for each saved `e2e.sh` run.
@@ -866,6 +677,7 @@ def e2e_report(args):
             if line.startswith("resources"):
                 print("  " + line)
 
+
 def write(kind, records):
     RESULTS.mkdir(exist_ok=True)
     path = RESULTS / f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}.json"
@@ -876,34 +688,23 @@ def write(kind, records):
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("synth").set_defaults(run=synth)
-    p = sub.add_parser("stt")
-    p.add_argument("--trials", type=int, default=3)
-    p.add_argument("--hints", nargs="+", default=["none", "default", "extended", "contextual"])
-    p.add_argument("--models", nargs="+", default=STT_MODELS)
-    p.add_argument("--cold", action="store_true", help="new connection per request")
-    p.add_argument("--pace", type=float, default=3.5, help="seconds between requests (rate limit)")
-    p.set_defaults(run=stt)
-    p = sub.add_parser("stt-live", help="fixed audio -> live STT (the app's streaming code), no cleanup")
-    p.add_argument("--provider", choices=["muse", "deepgram", "scribe"], default="muse")
-    p.add_argument("--language", help="override settings.json language (auto: detect)")
-    p.add_argument("--chunk-ms", type=int, default=50, help="Scribe message size; capture sends 50 ms")
-    p.add_argument("--label", help="results label (default: provider[-keyterms])")
+    p = sub.add_parser("stt", help="fixed audio -> Muse (the app's streaming code), no cleanup")
     p.add_argument("--kind", nargs="*", choices=["author", "librivox", "neural", "espeak"], help="default: all")
     p.add_argument("--core", action="store_true", help="the author's core clips only")
     p.add_argument("--case", nargs="*")
     p.add_argument("--keyterms", action="store_true", help="send the extended vocabulary for technical clips")
     p.add_argument("--trials", type=int, default=1)
     p.add_argument("--concurrency", type=int, default=4)
-    p.set_defaults(run=stt_live)
+    p.set_defaults(run=stt)
     p = sub.add_parser("record", help="record the author's pending core STT clips")
     p.add_argument("--case", nargs="*")
     p.add_argument("--again", action="store_true", help="re-record existing clips")
     p.set_defaults(run=record)
-    p = sub.add_parser("cleanup", help="stored transcripts -> cleanup provider -> evaluator")
+    p = sub.add_parser("cleanup", help="stored transcripts -> Haiku -> evaluator")
     p.add_argument("--suite", choices=sorted(SUITES), default="smoke",
                    help="smoke: ~13 dev cases; dev: prompt-dev; holdout: never tune on it; full: both")
-    p.add_argument("--provider", nargs="+", choices=sorted(PROVIDERS), default=["groq-20b"])
+    p.add_argument("--effort", nargs="+", choices=EFFORTS, default=["none"],
+                   help="none = thinking disabled, as the app sends")
     p.add_argument("--prompt", nargs="+", choices=sorted(PROMPTS), default=["app"],
                    help="system prompt variants (bench/prompts.json; app = CLEANUP_SYSTEM_PROMPT)")
     p.add_argument("--case", nargs="*", help="case ids")
@@ -917,13 +718,6 @@ def main():
     p.add_argument("--verbose", "-v", action="store_true", help="also list soft failures")
     p.add_argument("--quiet", "-q", action="store_true", help="do not write bench/results")
     p.set_defaults(run=cleanup)
-    p = sub.add_parser("connection")
-    p.add_argument("--provider", nargs="+", choices=sorted(PROVIDERS), default=["router-haiku", "groq-20b", "router-20b"])
-    p.add_argument("--prompt", choices=sorted(PROMPTS), default="app")
-    p.add_argument("--rounds", type=int, default=6)
-    p.add_argument("--warm", type=int, default=4, help="warm requests after each cold/idle one")
-    p.add_argument("--idle", type=float, default=100, help="seconds of silence between rounds")
-    p.set_defaults(run=connection)
     p = sub.add_parser("e2e-report")
     p.add_argument("outputs", nargs="+", help="saved e2e.sh outputs")
     p.set_defaults(run=e2e_report)

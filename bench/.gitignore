@@ -2,3 +2,4 @@
 # Private dictations exported from Wispr Flow: local only, never commit (public repo).
 audio/flow/
 cleanup.local.json
+results/
