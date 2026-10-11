@@ -302,6 +302,38 @@ def stt_cases(args):
     return cases
 
 
+COMMANDS = {"git status", "pnpm check", "pnpm install", "cargo test"}
+
+def term_kind(term):
+    """Scoring category of a reference term; a term may be only one."""
+    if term in COMMANDS:
+        return "command"
+    if "/" in term or re.fullmatch(r"[\w-]+\.(rs|toml|lock|json|ts|tsx)", term):
+        return "path"
+    if term in ("9Router", "T3 Code"):
+        return "term"
+    if re.search(r"[A-Za-z]{2}.*\d|\d.*[A-Za-z]{2,}", term) and not re.fullmatch(r"\d+(\.\d+)?\s*\w{1,3}", term) \
+            or term in ("GPT-OSS", "Scribe v2 Realtime", "Whisper large-v3", "Nova-3"):
+        return "model"
+    if any(ch.isdigit() for ch in term) or term in ("three retries",):
+        return "number"
+    return "term"
+
+def command_shape(term, text):
+    """How a command or path came out: exact, case (only letter case differs), spoken
+    (same characters, other separators: "src tauri slash", "Cargotoml"), partial (some
+    parts missing or replaced), missing (no part survives)."""
+    if contains(text, term):
+        return "exact"
+    if contains(text, term, case=False):
+        return "case"
+    parts = [p for p in re.split(r"[^a-z0-9]+", term.lower()) if p]
+    heard = squash(text.replace("slash", "").replace(" dot ", ""))
+    if squash(term) in heard:
+        return "spoken"
+    got = [p for p in parts if p in words(text) or p in heard]
+    return "partial" if got else "missing"
+
 def stt_live(args):
     """Fixed audio -> live STT through the app's own streaming code (examples/stt.rs), at real
     time, no cleanup. Latency: `first_partial` from the first audio sent, `release_to_final`
@@ -318,59 +350,75 @@ def stt_live(args):
             # The app sends keyterms only into technical windows; the core corpus is mixed.
             terms = CORPUS["vocabulary"]["extended"] if args.keyterms and case["terms"] else []
             jobs.append({"id": f"{case['id']}#{trial}", "audio": str(audio_path(case)), "keyterms": terms})
+    env = dict(os.environ, STT_LANGUAGE=args.language or settings().get("language", "en"),
+               SCRIBE_CHUNK_MS=str(args.chunk_ms))
     out = subprocess.run([str(binary), args.provider, str(args.concurrency)], input=json.dumps(jobs),
-                         capture_output=True, text=True, timeout=600)
+                         capture_output=True, text=True, timeout=900, env=env)
     by_id = {c["id"]: c for c in cases}
+    label = args.label or "-".join([args.provider] + (["keyterms"] if args.keyterms else []))
     records = []
     for line in out.stdout.splitlines():
         r = json.loads(line)
         case = by_id[r["id"].split("#")[0]]
-        r.update(case=case["id"], kind=case["kind"], provider=args.provider)
+        r.update(case=case["id"], kind=case["kind"], provider=label, language=env["STT_LANGUAGE"],
+                 chunk_ms=args.chunk_ms if args.provider == "scribe" else None)
         if r.get("text") is not None:
             r["wer"] = round(wer(case["reference"], r["text"]), 3)
-            # "three" counts for "3"; other terms must match their written form (case aside).
+            # Accuracy: the term was heard ("three" counts for "3"). Format: written exactly.
             r["missed"] = [t for t in case["terms"] if not contains(r["text"], t, case=False)
-                           and not (t.isdigit() and has_span(r["text"], t))]
+                           and not has_span(r["text"], t)]
+            r["misformatted"] = [t for t in case["terms"] if not contains(r["text"], t)]
+            r["shapes"] = {t: command_shape(t, r["text"]) for t in case["terms"]
+                           if term_kind(t) in ("command", "path")}
             subs, dels, ins = alignment(case["reference"], r["text"])
             r["omitted"] = dels
         records.append(r)
     if out.returncode:
         print(out.stderr[-2000:], file=sys.stderr)
-    write(f"stt-{args.provider}", records)
+    write(f"stt-{label}", records)
     report_stt_live(records, cases)
 
-
 def report_stt_live(records, cases):
-    """Real voice and synthetic speech never share a row."""
-    print(f"\n{'provider':9} {'kind':9} {'n':>3} {'WER':>6} {'terms':>7} {'numbers':>7} {'omit':>4} "
-          f"{'partial50':>9} {'final50':>7} {'final95':>7} {'fail':>4}")
+    """Real voice and synthetic speech never share a row. Per category, `heard/exact/total`:
+    heard ignores case and number spelling, exact is the written form."""
+    kinds = ("term", "command", "path", "model", "number")
+    print(f"\n{'config':18} {'kind':8} {'n':>3} {'WER':>6} {'omit':>4} "
+          + " ".join(f"{k:>10}" for k in kinds)
+          + f" {'ready50/95':>11} {'part50/95':>11} {'final50/95':>11} {'fail':>4}")
     for kind in ("author", "librivox", "neural", "espeak"):
         group = [r for r in records if r["kind"] == kind]
         if not group:
             continue
         ok = [r for r in group if r.get("text") is not None]
-        terms = [t for c in cases if c["kind"] == kind for t in c["terms"]]
-        trials = len(group) // max(1, len({r["case"] for r in group}))
-        missed = sum(len(r["missed"]) for r in ok)
-        numbers = [t for c in cases if c["kind"] == kind for t in c["terms"] if any(ch.isdigit() for ch in t)]
-        missed_numbers = sum(1 for r in ok for t in r["missed"] if any(ch.isdigit() for ch in t))
-        partial = summary([r["first_partial_ms"] for r in ok if r.get("first_partial_ms") is not None])
-        final = summary([r["release_to_final_ms"] for r in ok])
-        print(f"{group[0]['provider']:9} {kind:9} {len(group):>3} {statistics.mean(r['wer'] for r in ok) if ok else 0:>6.3f} "
-              f"{len(terms) * trials - missed:>3}/{len(terms) * trials:<3} "
-              f"{len(numbers) * trials - missed_numbers:>3}/{len(numbers) * trials:<3} "
-              f"{sum(len(r['omitted']) for r in ok):>4} {partial['p50'] or '-':>9} {final['p50'] or '-':>7} "
-              f"{final['p95'] or '-':>7} {len(group) - len(ok):>4}")
+        by_case = {c["id"]: c for c in cases}
+        cells = []
+        for category in kinds:
+            total = sum(1 for r in ok for t in by_case[r["case"]]["terms"] if term_kind(t) == category)
+            heard = total - sum(1 for r in ok for t in r["missed"] if term_kind(t) == category)
+            exact = total - sum(1 for r in ok for t in r["misformatted"] if term_kind(t) == category)
+            cells.append(f"{heard}/{exact}/{total}" if total else "-")
+        def p(key):
+            s = summary([r[key] for r in ok if r.get(key) is not None])
+            return f"{s['p50'] or '-'}/{s['p95'] or '-'}"
+        print(f"{group[0]['provider']:18} {kind:8} {len(group):>3} "
+              f"{statistics.mean(r['wer'] for r in ok) if ok else 0:>6.3f} {sum(len(r['omitted']) for r in ok):>4} "
+              + " ".join(f"{c:>10}" for c in cells)
+              + f" {p('ready_ms'):>11} {p('first_partial_ms'):>11} {p('release_to_final_ms'):>11} {len(group) - len(ok):>4}")
     failures = {}
     for r in records:
         if r.get("text") is None:
             failures[r.get("error")] = failures.get(r.get("error"), 0) + 1
     if failures:
         print("failures: " + ", ".join(f"{k}={v}" for k, v in failures.items()))
+    shapes = {}
+    for r in records:
+        for shape in (r.get("shapes") or {}).values():
+            shapes[shape] = shapes.get(shape, 0) + 1
+    if shapes:
+        print("commands/paths: " + ", ".join(f"{k}={v}" for k, v in sorted(shapes.items())))
     for r in sorted(records, key=lambda r: r["case"]):
-        if r.get("missed") or (r.get("wer") or 0) > 0.15:
-            print(f"  {r['case']}: WER {r['wer']}, missed {r['missed']}: {r['text'][:120]}")
-
+        if r.get("misformatted") or (r.get("wer") or 0) > 0.15:
+            print(f"  {r['case']}: WER {r['wer']}, missed {r['missed']}, format {sorted(set(r['misformatted']) - set(r['missed']))}: {r['text'][:120]}")
 
 def cut_off(path):
     """True when the clip ends in speech: the last 200 ms are well above the room's noise floor.
@@ -831,7 +879,10 @@ def main():
     p.add_argument("--pace", type=float, default=3.5, help="seconds between requests (rate limit)")
     p.set_defaults(run=stt)
     p = sub.add_parser("stt-live", help="fixed audio -> live STT (the app's streaming code), no cleanup")
-    p.add_argument("--provider", choices=["muse", "deepgram"], default="muse")
+    p.add_argument("--provider", choices=["muse", "deepgram", "scribe"], default="muse")
+    p.add_argument("--language", help="override settings.json language (auto: detect)")
+    p.add_argument("--chunk-ms", type=int, default=50, help="Scribe message size; capture sends 50 ms")
+    p.add_argument("--label", help="results label (default: provider[-keyterms])")
     p.add_argument("--kind", nargs="*", choices=["author", "librivox", "neural", "espeak"], help="default: all")
     p.add_argument("--core", action="store_true", help="the author's core clips only")
     p.add_argument("--case", nargs="*")

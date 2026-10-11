@@ -660,6 +660,99 @@
         "TanStack",
         "Tauri"
       ]
+    },
+    {
+      "id": "neural-filler-provider-andrew",
+      "audio": "audio/neural-filler-provider-andrew.wav",
+      "synthetic": true,
+      "voice": "en-US-AndrewNeural",
+      "say": "I need, uh, to update the provider.",
+      "reference": "I need, uh, to update the provider.",
+      "terms": [
+        "provider"
+      ],
+      "kind": "neural"
+    },
+    {
+      "id": "neural-git-pnpm-andrew",
+      "audio": "audio/neural-git-pnpm-andrew.wav",
+      "synthetic": true,
+      "voice": "en-US-AndrewNeural",
+      "say": "Run git status and then pnpm check.",
+      "reference": "Run git status and then pnpm check.",
+      "terms": [
+        "git status",
+        "pnpm check"
+      ],
+      "kind": "neural"
+    },
+    {
+      "id": "neural-gpt-oss-andrew",
+      "audio": "audio/neural-gpt-oss-andrew.wav",
+      "synthetic": true,
+      "voice": "en-US-AndrewNeural",
+      "say": "Use GPT OSS 120 B, not GPT OSS 20 B.",
+      "reference": "Use GPT-OSS 120B, not GPT-OSS 20B.",
+      "terms": [
+        "GPT-OSS",
+        "120B",
+        "20B",
+        "not"
+      ],
+      "kind": "neural"
+    },
+    {
+      "id": "neural-cargo-dependency-andrew",
+      "audio": "audio/neural-cargo-dependency-andrew.wav",
+      "synthetic": true,
+      "voice": "en-US-AndrewNeural",
+      "say": "Open Cargo dot toml and change the dependency version.",
+      "reference": "Open Cargo.toml and change the dependency version.",
+      "terms": [
+        "Cargo.toml"
+      ],
+      "kind": "neural"
+    },
+    {
+      "id": "neural-keep-implementation-andrew",
+      "audio": "audio/neural-keep-implementation-andrew.wav",
+      "synthetic": true,
+      "voice": "en-US-AndrewNeural",
+      "say": "I think we should keep this implementation, you know, because it is more reliable.",
+      "reference": "I think we should keep this implementation, you know, because it is more reliable.",
+      "terms": [
+        "implementation"
+      ],
+      "kind": "neural"
+    },
+    {
+      "id": "neural-version-retries-andrew",
+      "audio": "audio/neural-version-retries-andrew.wav",
+      "synthetic": true,
+      "voice": "en-US-AndrewNeural",
+      "say": "Bump it to version 3, keep three retries, and use 16 kilohertz with Claude Haiku 5.5.",
+      "reference": "Bump it to version 3, keep three retries, and use 16 kHz with Claude Haiku 5.5.",
+      "terms": [
+        "3",
+        "three retries",
+        "16 kHz",
+        "Claude Haiku 5.5"
+      ],
+      "kind": "neural"
+    },
+    {
+      "id": "neural-scribe-whisper-andrew",
+      "audio": "audio/neural-scribe-whisper-andrew.wav",
+      "synthetic": true,
+      "voice": "en-US-AndrewNeural",
+      "say": "Compare Scribe v2 Realtime with Whisper large v3 and Muse.",
+      "reference": "Compare Scribe v2 Realtime with Whisper large-v3 and Muse.",
+      "terms": [
+        "Scribe v2 Realtime",
+        "Whisper large-v3",
+        "Muse"
+      ],
+      "kind": "neural"
     }
   ],
   "cleanup": [

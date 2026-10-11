@@ -2,7 +2,9 @@
 //! transcribers at real time and prints one JSON line per clip. No cleanup, no app, no audio
 //! device. Driven by `bench/run.py stt-live`; reads jobs from stdin:
 //! `[{"id": "...", "audio": "/abs/clip.wav", "keyterms": ["9Router"]}]`.
-//! `cargo run --example stt -- muse|deepgram [concurrency] < jobs.json`
+//! `cargo run --example stt -- muse|deepgram|scribe [concurrency] < jobs.json`
+//! `STT_LANGUAGE` overrides the language (`auto` detects); `SCRIBE_CHUNK_MS` sets Scribe's
+//! message size (default: the 50 ms capture fragment).
 use futures_util::StreamExt;
 use std::time::{Duration, Instant};
 use voice_prompt::settings::{self, StreamingProvider};
@@ -26,20 +28,30 @@ async fn main() -> anyhow::Result<()> {
     settings.streaming_provider = match args.get(1).map(String::as_str) {
         Some("muse") => StreamingProvider::Muse,
         Some("deepgram") => StreamingProvider::Deepgram,
-        _ => anyhow::bail!("usage: stt muse|deepgram [concurrency] < jobs.json"),
+        Some("scribe") => StreamingProvider::Scribe,
+        _ => anyhow::bail!("usage: stt muse|deepgram|scribe [concurrency] < jobs.json"),
     };
+    if let Ok(language) = std::env::var("STT_LANGUAGE") {
+        settings.language = language;
+    }
+    let chunk_ms = std::env::var("SCRIBE_CHUNK_MS").map_or(Ok(50), |n| n.parse())?;
     let concurrency = args.get(2).map_or(Ok(2), |n| n.parse())?;
     let jobs: Vec<Job> = serde_json::from_reader(std::io::stdin())?;
     let client = reqwest::Client::new();
     futures_util::stream::iter(jobs)
-        .map(|job| run(&client, &settings, job))
+        .map(|job| run(&client, &settings, chunk_ms, job))
         .buffer_unordered(concurrency)
         .for_each(|line| async move { println!("{line}") })
         .await;
     Ok(())
 }
 
-async fn run(client: &reqwest::Client, settings: &settings::Settings, job: Job) -> String {
+async fn run(
+    client: &reqwest::Client,
+    settings: &settings::Settings,
+    chunk_ms: u64,
+    job: Job,
+) -> String {
     let samples = match std::fs::read(&job.audio)
         .map_err(anyhow::Error::from)
         .and_then(|b| wav_samples(&b))
@@ -51,7 +63,14 @@ async fn run(client: &reqwest::Client, settings: &settings::Settings, job: Job) 
     };
     // Press: the session starts connecting while audio queues, as in the app.
     let pressed = Instant::now();
-    let (session, sink) = streaming::start(client.clone(), settings, &job.keyterms);
+    let (session, sink) = match settings.streaming_provider {
+        StreamingProvider::Scribe => streaming::ScribeStreamingTranscriber {
+            chunk_ms,
+            ..streaming::ScribeStreamingTranscriber::new(settings)
+        }
+        .start(&job.keyterms),
+        _ => streaming::start(client.clone(), settings, &job.keyterms),
+    };
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     for chunk in samples.chunks(CHUNK) {
         tick.tick().await;
@@ -77,6 +96,7 @@ async fn run(client: &reqwest::Client, settings: &settings::Settings, job: Job) 
         "error": error,
         "audio_ms": samples.len() as u64 * 1000 / 16_000,
         "ready_ms": since(stats.ready, pressed),
+        "connected_ms": since(stats.connected, pressed),
         "first_partial_ms": stats.first_sent.and_then(|sent| since(stats.first_partial, sent)),
         "release_to_final_ms": (finished - released).as_millis() as u64,
     })
