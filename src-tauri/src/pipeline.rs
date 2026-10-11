@@ -411,7 +411,7 @@ pub struct Latency {
     delivery: String,
     /// confirmed | changed | unknown: the press-time window versus the window at delivery.
     destination: &'static str,
-    /// streaming_deepgram | streaming_muse | batch_fallback | batch (streaming off, or a retry)
+    /// streaming_deepgram | streaming_muse | streaming_scribe | batch_fallback | batch (streaming off, or a retry)
     stt_mode: &'static str,
     /// Why streaming produced no trusted transcript; empty unless `batch_fallback`.
     fallback_reason: &'static str,

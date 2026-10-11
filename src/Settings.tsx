@@ -15,7 +15,7 @@ type SettingsData = {
   language: string;
   streaming: boolean;
   streaming_model: string;
-  streaming_provider: "deepgram" | "muse";
+  streaming_provider: "deepgram" | "muse" | "scribe";
   cleanup_enabled: boolean;
   cleanup_provider: "router" | "groq";
   cleanup_model: string;
@@ -204,11 +204,14 @@ function Speech({ settings, update }: SectionProps) {
   const [testing, setTesting] = useState(false);
   const [hasMuseKey, setHasMuseKey] = useState(false);
   const [museKey, setMuseKey] = useState("");
+  const [hasScribeKey, setHasScribeKey] = useState(false);
+  const [scribeKey, setScribeKey] = useState("");
 
   useEffect(() => {
     invoke<Microphone[]>("list_microphones").then(setMicrophones).catch(() => setMicrophones([]));
     invoke<boolean>("has_api_key").then(setHasKey).catch(() => setHasKey(false));
     invoke<boolean>("has_muse_key").then(setHasMuseKey).catch(() => setHasMuseKey(false));
+    invoke<boolean>("has_elevenlabs_key").then(setHasScribeKey).catch(() => setHasScribeKey(false));
   }, []);
 
   const saveMuseKey = async () => {
@@ -226,6 +229,28 @@ function Speech({ settings, update }: SectionProps) {
     setTesting(true);
     try {
       setTest({ ok: true, text: await invoke<string>("test_muse") });
+    } catch (error) {
+      setTest({ ok: false, text: String(error) });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const saveScribeKey = async () => {
+    try {
+      await invoke("set_elevenlabs_key", { key: scribeKey });
+      setScribeKey("");
+      setHasScribeKey(scribeKey.trim().length > 0);
+      setTest({ ok: true, text: scribeKey.trim() ? "ElevenLabs key saved to the system keyring." : "ElevenLabs key removed." });
+    } catch (error) {
+      setTest({ ok: false, text: String(error) });
+    }
+  };
+
+  const testScribe = async () => {
+    setTesting(true);
+    try {
+      setTest({ ok: true, text: await invoke<string>("test_elevenlabs") });
     } catch (error) {
       setTest({ ok: false, text: String(error) });
     } finally {
@@ -298,6 +323,7 @@ function Speech({ settings, update }: SectionProps) {
       <Row label="Live transcription provider">
         <select value={settings.streaming_provider} onChange={(e) => update({ streaming_provider: e.target.value as SettingsData["streaming_provider"] })}>
           <option value="muse">Meta Muse Voice Transcribe</option>
+          <option value="scribe">ElevenLabs Scribe v2 Realtime (experimental)</option>
           <option value="deepgram">Deepgram Nova-3</option>
         </select>
       </Row>
@@ -316,12 +342,30 @@ function Speech({ settings, update }: SectionProps) {
           </button>
         </span>
       </Row>
+      <Row label="ElevenLabs API key" hint={hasScribeKey ? "Stored in the system keyring. Enter a new one to replace it." : "Not set. Only needed for ElevenLabs Scribe."}>
+        <span className="inline">
+          <input
+            type="password"
+            autoComplete="off"
+            placeholder={hasScribeKey ? "••••••••" : "sk_…"}
+            value={scribeKey}
+            onChange={(e) => setScribeKey(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && saveScribeKey()}
+          />
+          <button onClick={saveScribeKey} disabled={!scribeKey && !hasScribeKey}>
+            {scribeKey || !hasScribeKey ? "Save" : "Remove"}
+          </button>
+        </span>
+      </Row>
       <div className="actions">
         <button onClick={runTest} disabled={testing}>
           {testing ? "Testing…" : "Test connection"}
         </button>
         <button onClick={testMuse} disabled={testing || !hasMuseKey}>
           Test Muse
+        </button>
+        <button onClick={testScribe} disabled={testing || !hasScribeKey}>
+          Test ElevenLabs
         </button>
         {test ? <span className={test.ok ? "ok" : "error"}>{test.text}</span> : null}
       </div>

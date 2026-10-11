@@ -346,6 +346,29 @@ fn set_muse_key(key: String) -> CommandResult<()> {
 }
 
 #[tauri::command]
+fn has_elevenlabs_key() -> CommandResult<bool> {
+    settings::secret::get_for(settings::secret::ELEVENLABS)
+        .map(|k| k.is_some())
+        .map_err(text_error)
+}
+
+#[tauri::command]
+fn set_elevenlabs_key(key: String) -> CommandResult<()> {
+    settings::secret::set_for(settings::secret::ELEVENLABS, key.trim()).map_err(text_error)
+}
+
+/// Starts a Scribe session with the stored key, without sending audio.
+#[tauri::command]
+async fn test_elevenlabs() -> CommandResult<String> {
+    let started = Instant::now();
+    streaming::scribe_check().await.map_err(|e| e.to_string())?;
+    Ok(format!(
+        "ElevenLabs accepted the key ({} ms).",
+        started.elapsed().as_millis()
+    ))
+}
+
+#[tauri::command]
 fn has_groq_key() -> CommandResult<bool> {
     settings::secret::get_for(settings::secret::GROQ)
         .map(|k| k.is_some())
@@ -736,6 +759,9 @@ fn main() {
             has_muse_key,
             set_muse_key,
             test_muse,
+            has_elevenlabs_key,
+            set_elevenlabs_key,
+            test_elevenlabs,
             has_groq_key,
             set_groq_key,
             test_groq,

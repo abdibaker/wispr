@@ -4,6 +4,9 @@
 //! - Deepgram: 9Router mints a short-lived token. After `CloseStream`, Deepgram
 //!   flushes the remaining results, sends `Metadata`, then closes; only that `Metadata`
 //!   completes a session. `is_final`, `speech_final`, silence or a bare close never do.
+//! - ElevenLabs Scribe (experimental): direct key in `xi-api-key`, manual commit. The release
+//!   sends the last audio with `commit: true`; only the `committed_transcript` that follows
+//!   completes a session.
 //! - Meta Muse (default): the Meta key goes in the first JSON frame, not a header.
 //!   After `endStream`, a push-to-talk session ends with one `transcript` event marked
 //!   `final: true` and then a normal close (1000); anything else falls back to batch STT.
@@ -44,6 +47,11 @@ const MAX_KEYTERMS: usize = 50;
 /// Muse fails the whole session (`provider_error`) on a keyword over 20 characters
 /// (measured 2026-10), so longer terms are skipped rather than sent.
 const MUSE_MAX_KEYWORD_CHARS: usize = 20;
+pub const SCRIBE_URL: &str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
+pub const SCRIBE_MODEL: &str = "scribe_v2_realtime";
+/// Documented realtime limits: at most 50 keyterms of at most 20 characters each.
+const SCRIBE_MAX_KEYTERMS: usize = 50;
+const SCRIBE_MAX_KEYTERM_CHARS: usize = 20;
 /// Deepgram's flush after CloseStream normally takes a few hundred ms; past this the
 /// session is untrusted and the retained recording goes to batch STT.
 const FINALIZE_DEADLINE: Duration = Duration::from_secs(3);
@@ -122,7 +130,7 @@ impl AudioSink {
 
 /// A running session. Dropping it cancels: the socket closes without finalizing.
 pub struct StreamSession {
-    /// `streaming_deepgram` | `streaming_muse`
+    /// `streaming_deepgram` | `streaming_muse` | `streaming_scribe`
     mode: &'static str,
     /// Attribution for history, e.g. `deepgram/nova-3`.
     model: String,
@@ -144,7 +152,7 @@ pub struct Streamed {
 #[derive(Debug)]
 pub struct Conclusion {
     pub transcript: std::result::Result<Streamed, &'static str>,
-    /// `streaming_deepgram` | `streaming_muse`
+    /// `streaming_deepgram` | `streaming_muse` | `streaming_scribe`
     pub mode: &'static str,
     pub stats: Stats,
 }
@@ -203,6 +211,7 @@ pub fn start(
 ) -> (StreamSession, AudioSink) {
     match settings.streaming_provider {
         StreamingProvider::Muse => MuseStreamingTranscriber::new(settings).start(keyterms),
+        StreamingProvider::Scribe => ScribeStreamingTranscriber::new(settings).start(keyterms),
         StreamingProvider::Deepgram => {
             DeepgramStreamingTranscriber::new(client, settings).start(keyterms)
         }
@@ -261,18 +270,55 @@ impl MuseStreamingTranscriber {
     pub fn start(&self, keyterms: &[String]) -> (StreamSession, AudioSink) {
         let language = self.language_bias.then_some(self.language.as_str());
         let config = muse_config(language, keyterms);
-        let key: TokenFuture = Box::pin(async {
-            tauri::async_runtime::spawn_blocking(|| {
-                crate::settings::secret::get_for(crate::settings::secret::MUSE)
-            })
-            .await
-            .map_err(|_| fail("auth", "Keyring read stopped"))??
-            .ok_or_else(|| fail("auth", "No Meta Muse API key. Open Settings → Speech."))
-        });
+        let key = keyring_key(
+            crate::settings::secret::MUSE,
+            "No Meta Muse API key. Open Settings → Speech.",
+        );
         spawn(muse_label(), move |audio| {
             muse(key, MUSE_URL.into(), config, audio)
         })
     }
+}
+
+fn scribe_label() -> (&'static str, String) {
+    ("streaming_scribe", format!("elevenlabs/{SCRIBE_MODEL}"))
+}
+
+/// Experimental: ElevenLabs Scribe v2 Realtime with the direct API key.
+pub struct ScribeStreamingTranscriber {
+    pub language: String,
+    /// Audio per message; the capture fragment is 50 ms. Only for benchmarking.
+    pub chunk_ms: u64,
+}
+
+impl ScribeStreamingTranscriber {
+    pub fn new(settings: &Settings) -> Self {
+        Self {
+            language: settings.language.clone(),
+            chunk_ms: 50,
+        }
+    }
+
+    pub fn start(&self, keyterms: &[String]) -> (StreamSession, AudioSink) {
+        let url = scribe_url(SCRIBE_URL, &self.language, keyterms);
+        let chunk_bytes = (self.chunk_ms * audio::RATE as u64 / 1000 * 2) as usize;
+        let key = keyring_key(
+            crate::settings::secret::ELEVENLABS,
+            "No ElevenLabs API key. Open Settings → Speech.",
+        );
+        spawn(scribe_label(), move |audio| {
+            scribe(key, url, chunk_bytes, audio)
+        })
+    }
+}
+
+fn keyring_key(account: &'static str, missing: &'static str) -> TokenFuture {
+    Box::pin(async move {
+        tauri::async_runtime::spawn_blocking(move || crate::settings::secret::get_for(account))
+            .await
+            .map_err(|_| fail("auth", "Keyring read stopped"))??
+            .ok_or_else(|| fail("auth", missing))
+    })
 }
 
 type TokenFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
@@ -761,6 +807,270 @@ async fn muse(
     };
     let ((), text) = tokio::try_join!(send, receive)?;
     Ok(text)
+}
+
+/// The realtime URL. The key goes in a header; `no_verbatim` stays off so the transcript
+/// is raw speech and cleanup alone rewrites it.
+fn scribe_url(base: &str, language: &str, keyterms: &[String]) -> String {
+    let mut url = reqwest::Url::parse(base).expect("valid Scribe URL");
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("model_id", SCRIBE_MODEL)
+            .append_pair("audio_format", "pcm_16000")
+            .append_pair("commit_strategy", "manual")
+            .append_pair("no_verbatim", "false");
+        if !language.is_empty() && language != "auto" {
+            query.append_pair("language_code", language);
+        }
+        // A longer term would be rejected; it stays available to cleanup.
+        for term in crate::settings::vocabulary_terms(keyterms)
+            .into_iter()
+            .filter(|t| t.chars().count() <= SCRIBE_MAX_KEYTERM_CHARS)
+            .take(SCRIBE_MAX_KEYTERMS)
+        {
+            query.append_pair("keyterms", term);
+        }
+    }
+    url.into()
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let n = group
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= group.len() {
+                ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+fn scribe_chunk(bytes: &[u8], commit: bool) -> Message {
+    Message::text(
+        serde_json::json!({
+            "message_type": "input_audio_chunk",
+            "audio_base_64": base64(bytes),
+            "commit": commit,
+            "sample_rate": audio::RATE,
+        })
+        .to_string(),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "message_type", rename_all = "snake_case")]
+enum ScribeEvent {
+    SessionStarted {},
+    PartialTranscript {
+        text: String,
+    },
+    CommittedTranscript {
+        text: String,
+    },
+    AuthError {},
+    RateLimited {},
+    QuotaExceeded {},
+    CommitThrottled {},
+    ResourceExhausted {},
+    QueueOverflow {},
+    /// `error`, `input_error`, `invalid_request`, `transcriber_error`, …
+    #[serde(other)]
+    Other,
+}
+
+fn scribe_error(message_type: &str) -> anyhow::Error {
+    match message_type {
+        "auth_error" | "unaccepted_terms" => fail("auth", "ElevenLabs authentication failed"),
+        "rate_limited" | "quota_exceeded" | "commit_throttled" | "resource_exhausted"
+        | "queue_overflow" => fail("rate_limited", "ElevenLabs rate limit reached"),
+        _ => fail("provider_error", "ElevenLabs reported an error"),
+    }
+}
+
+/// Parses one server frame; errors carry only their type, never the server's text.
+fn scribe_event(text: &str) -> Result<ScribeEvent> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| fail("protocol", "Invalid ElevenLabs message"))?;
+    let message_type = value["message_type"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let event: ScribeEvent = serde_json::from_value(value)
+        .map_err(|_| fail("protocol", "Invalid ElevenLabs message"))?;
+    match event {
+        ScribeEvent::AuthError {}
+        | ScribeEvent::RateLimited {}
+        | ScribeEvent::QuotaExceeded {}
+        | ScribeEvent::CommitThrottled {}
+        | ScribeEvent::ResourceExhausted {}
+        | ScribeEvent::QueueOverflow {} => Err(scribe_error(&message_type)),
+        // Only error frames have an `error` field; warnings and extra events are ignored.
+        ScribeEvent::Other
+            if message_type.ends_with("error") || message_type == "invalid_request" =>
+        {
+            Err(scribe_error(&message_type))
+        }
+        event => Ok(event),
+    }
+}
+
+/// Streams with manual commit. After the audio ends, one commit frame closes the segment and
+/// the session completes on the next `committed_transcript`; partials are never delivered.
+/// Segments the server commits on its own (~36 s of audio) are kept in order.
+async fn scribe(
+    key: TokenFuture,
+    url: String,
+    chunk_bytes: usize,
+    mut audio: Audio,
+) -> Result<String> {
+    let stats = audio.stats.clone();
+    let key = key.await?;
+    let mut request = url
+        .into_client_request()
+        .map_err(|_| fail("connect", "Invalid ElevenLabs URL"))?;
+    let mut header =
+        HeaderValue::from_str(&key).map_err(|_| fail("auth", "Invalid ElevenLabs key"))?;
+    header.set_sensitive(true);
+    request.headers_mut().insert("xi-api-key", header);
+    drop(key);
+    let (socket, _) =
+        tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+            .await
+            .map_err(|_| fail("connect_timeout", "ElevenLabs connection timed out"))?
+            .map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Http(response) => {
+                    let status = response.status();
+                    let kind = match status {
+                        StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "auth",
+                        _ => "connect",
+                    };
+                    fail(
+                        kind,
+                        format!("ElevenLabs rejected the connection ({status})"),
+                    )
+                }
+                _ => fail("connect", "Cannot connect to ElevenLabs"),
+            })?;
+    mark(&stats, |s| &mut s.connected);
+    let (mut writer, mut reader) = socket.split();
+    let started = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        while let Some(message) = reader.next().await {
+            match message.map_err(|_| fail("connect", "ElevenLabs connection failed"))? {
+                Message::Text(text) => {
+                    if let ScribeEvent::SessionStarted {} = scribe_event(&text)? {
+                        return Ok(());
+                    }
+                }
+                Message::Close(_) => {
+                    return Err(fail(
+                        "disconnected",
+                        "ElevenLabs closed during the handshake",
+                    ))
+                }
+                _ => {}
+            }
+        }
+        Err(fail(
+            "disconnected",
+            "ElevenLabs closed during the handshake",
+        ))
+    });
+    started
+        .await
+        .map_err(|_| fail("connect_timeout", "ElevenLabs handshake timed out"))??;
+    mark(&stats, |s| &mut s.ready);
+    let committing = AtomicBool::new(false);
+    let send = async {
+        let mut pending = Vec::with_capacity(chunk_bytes);
+        let mut ended = false;
+        while !ended {
+            match audio.next().await {
+                Some(bytes) => pending.extend_from_slice(&bytes),
+                None => ended = true,
+            }
+            if pending.len() < chunk_bytes && !ended {
+                continue;
+            }
+            // The last frame carries the remaining audio and the commit together.
+            if ended {
+                committing.store(true, Ordering::SeqCst);
+            }
+            writer
+                .send(scribe_chunk(&pending, ended))
+                .await
+                .map_err(|_| fail("disconnected", "ElevenLabs connection lost while sending"))?;
+            if !pending.is_empty() {
+                mark(&stats, |s| &mut s.first_sent);
+                stats.lock().unwrap().last_sent = Some(Instant::now());
+            }
+            pending.clear();
+        }
+        mark(&stats, |s| &mut s.finalize_sent);
+        Ok::<(), anyhow::Error>(())
+    };
+    let receive = async {
+        let mut segments: Vec<String> = Vec::new();
+        while let Some(message) = reader.next().await {
+            let message = message
+                .map_err(|_| fail("disconnected", "ElevenLabs stream ended before the commit"))?;
+            match message {
+                Message::Text(text) => match scribe_event(&text)? {
+                    ScribeEvent::PartialTranscript { text } => {
+                        if !text.trim().is_empty() {
+                            mark(&stats, |s| &mut s.first_partial);
+                        }
+                    }
+                    ScribeEvent::CommittedTranscript { text } => {
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            segments.push(text.to_string());
+                        }
+                        if committing.load(Ordering::SeqCst) {
+                            mark(&stats, |s| &mut s.first_final);
+                            return Ok(segments.join(" "));
+                        }
+                    }
+                    _ => {}
+                },
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        Err(fail(
+            "disconnected",
+            "ElevenLabs stream ended before the committed transcript",
+        ))
+    };
+    // ponytail: a server auto-commit (~36 s of audio) landing between the flag and our
+    // commit's reply would end the session one segment early; push-to-talk rarely nears it.
+    let ((), text) = tokio::try_join!(send, receive)?;
+    Ok(text)
+}
+
+/// Checks the stored ElevenLabs key: a session must start (no audio is sent).
+pub async fn scribe_check() -> Result<()> {
+    let (session, sink) = ScribeStreamingTranscriber {
+        language: String::new(),
+        chunk_ms: 50,
+    }
+    .start(&[]);
+    let stats = session.stats.clone();
+    drop(sink);
+    match session.finish(Duration::from_secs(10)).await {
+        Ok(_) => Ok(()),
+        Err(_) if stats.lock().unwrap().ready.is_some() => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Checks the stored Meta key with a handshake that sends no audio.
@@ -1495,5 +1805,405 @@ mod tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(1300));
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scribe_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+    const KEY: &str = "sk_scribe-secret";
+
+    fn key_after(delay: Duration) -> TokenFuture {
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(KEY.to_string())
+        })
+    }
+
+    fn session(url: String, chunk_ms: u64) -> (StreamSession, AudioSink) {
+        let chunk_bytes = (chunk_ms * audio::RATE as u64 / 1000 * 2) as usize;
+        spawn(scribe_label(), move |audio| {
+            scribe(
+                key_after(Duration::from_millis(200)),
+                url,
+                chunk_bytes,
+                audio,
+            )
+        })
+    }
+
+    fn event(json: serde_json::Value) -> Message {
+        Message::text(json.to_string())
+    }
+
+    fn partial(text: &str) -> Message {
+        event(serde_json::json!({"message_type": "partial_transcript", "text": text}))
+    }
+
+    fn committed(text: &str) -> Message {
+        event(serde_json::json!({"message_type": "committed_transcript", "text": text}))
+    }
+
+    fn chunk(value: i16) -> Vec<i16> {
+        vec![value; 800]
+    }
+
+    /// A mock Scribe: checks the key header and that the URL holds no secret, sends
+    /// `session_started` unless `start` is false, then runs `script`.
+    async fn server<F, Fut>(start: bool, script: F) -> (String, tokio::task::JoinHandle<()>)
+    where
+        F: FnOnce(Socket) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = scribe_url(
+            &format!(
+                "ws://{}/v1/speech-to-text/realtime",
+                listener.local_addr().unwrap()
+            ),
+            "en",
+            &[],
+        );
+        let handle = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            #[allow(clippy::result_large_err)]
+            let check = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                         response| {
+                assert_eq!(request.headers()["xi-api-key"], KEY);
+                assert!(!request.uri().to_string().contains(KEY));
+                Ok(response)
+            };
+            let mut socket = tokio_tungstenite::accept_hdr_async(connection, check)
+                .await
+                .unwrap();
+            if start {
+                socket
+                    .send(event(serde_json::json!({"message_type": "session_started", "session_id": "s", "config": {}})))
+                    .await
+                    .unwrap();
+            }
+            script(socket).await;
+        });
+        (url, handle)
+    }
+
+    /// Reads audio frames until the commit, returning the PCM, the per-frame sizes and the
+    /// commit frame's own audio length.
+    async fn until_commit(socket: &mut Socket) -> (Vec<i16>, Vec<usize>) {
+        let (mut samples, mut sizes) = (Vec::new(), Vec::new());
+        while let Some(Ok(message)) = socket.next().await {
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(frame["message_type"], "input_audio_chunk");
+            assert_eq!(frame["sample_rate"], 16000);
+            let bytes = decode(frame["audio_base_64"].as_str().unwrap());
+            sizes.push(bytes.len());
+            samples.extend(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| i16::from_le_bytes(*b)),
+            );
+            if frame["commit"] == true {
+                return (samples, sizes);
+            }
+        }
+        panic!("missing commit");
+    }
+
+    fn decode(text: &str) -> Vec<u8> {
+        let value = |c: u8| {
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                .iter()
+                .position(|&a| a == c)
+                .unwrap() as u32
+        };
+        let mut out = Vec::new();
+        for group in text.as_bytes().chunks(4) {
+            let n = group.iter().enumerate().fold(0, |n, (i, &c)| {
+                n | if c == b'=' {
+                    0
+                } else {
+                    value(c) << (18 - 6 * i)
+                }
+            });
+            let len = group.iter().filter(|&&c| c != b'=').count() - 1;
+            out.extend(&n.to_be_bytes()[1..1 + len]);
+        }
+        out
+    }
+
+    #[test]
+    fn base64_matches_the_standard_encoding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(decode(&base64(&bytes)), bytes);
+    }
+
+    #[test]
+    fn the_url_is_raw_manual_pcm16_with_filtered_keyterms() {
+        let url = scribe_url(SCRIBE_URL, "en", &[]);
+        for pair in [
+            "model_id=scribe_v2_realtime",
+            "audio_format=pcm_16000",
+            "commit_strategy=manual",
+            "no_verbatim=false",
+            "language_code=en",
+        ] {
+            assert!(url.contains(pair), "{pair}");
+        }
+        assert!(!url.contains("keyterms"), "prose windows send none");
+        assert!(!scribe_url(SCRIBE_URL, "auto", &[]).contains("language_code"));
+        let terms: Vec<String> = [
+            "9Router",
+            "whisper-large-v3-turbo",
+            "T3 Code",
+            "9router",
+            "src-tauri/src/main.rs",
+        ]
+        .map(String::from)
+        .to_vec();
+        let parsed = reqwest::Url::parse(&scribe_url(SCRIBE_URL, "en", &terms)).unwrap();
+        let sent: Vec<_> = parsed
+            .query_pairs()
+            .filter(|(k, _)| k == "keyterms")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(sent, ["9Router", "T3 Code"]);
+        let many: Vec<String> = (0..80).map(|i| format!("term{i}")).collect();
+        assert_eq!(
+            scribe_url(SCRIBE_URL, "en", &many)
+                .matches("keyterms=")
+                .count(),
+            SCRIBE_MAX_KEYTERMS
+        );
+    }
+
+    #[tokio::test]
+    async fn early_audio_is_replayed_in_order_and_only_the_committed_text_is_kept() {
+        let (url, server) = server(true, |mut socket| async move {
+            let (samples, sizes) = until_commit(&mut socket).await;
+            let expected: Vec<i16> = (0..30).flat_map(chunk).collect();
+            assert_eq!(samples, expected);
+            // 50 ms capture chunks go out as they arrive; the commit frame then carries none.
+            assert_eq!(sizes.last(), Some(&0));
+            assert!(sizes[..sizes.len() - 1].iter().all(|&n| n == 1600));
+            socket.send(partial("deploy tomorrow")).await.unwrap();
+            socket.send(partial("Deploy tomorrow, no, change")).await.unwrap();
+            socket
+                .send(committed("Deploy tomorrow, no, change that to Monday."))
+                .await
+                .unwrap();
+            // A late edit or timestamps event must not change or delay the result.
+            socket
+                .send(event(serde_json::json!({"message_type": "edited_transcript", "text": "x", "edited_text": "y"})))
+                .await
+                .ok();
+        })
+        .await;
+        let (session, sink) = session(url, 50);
+        for i in 0..30 {
+            sink.push(&chunk(i));
+        }
+        assert!(session.stats.lock().unwrap().ready.is_none());
+        drop(sink);
+        let stats = session.stats.clone();
+        assert_eq!(
+            session.finish(Duration::from_secs(3)).await.unwrap(),
+            "Deploy tomorrow, no, change that to Monday."
+        );
+        let stats = *stats.lock().unwrap();
+        assert!(stats.ready.unwrap() <= stats.first_sent.unwrap());
+        assert!(stats.finalize_sent.unwrap() <= stats.first_final.unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn larger_frames_aggregate_capture_chunks_without_losing_the_tail() {
+        let (url, server) = server(true, |mut socket| async move {
+            let (samples, sizes) = until_commit(&mut socket).await;
+            assert_eq!(samples.len(), 5 * 800);
+            assert_eq!(sizes, [3200, 3200, 1600]);
+            socket.send(committed("ok")).await.unwrap();
+        })
+        .await;
+        let (session, sink) = session(url, 100);
+        for i in 0..5 {
+            sink.push(&chunk(i));
+        }
+        drop(sink);
+        assert_eq!(session.finish(Duration::from_secs(3)).await.unwrap(), "ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_commit_before_release_is_kept_and_does_not_end_the_session() {
+        // The server commits on its own after ~36 s of audio.
+        let (url, server) = server(true, |mut socket| async move {
+            socket.next().await;
+            socket.send(committed("First segment.")).await.unwrap();
+            until_commit(&mut socket).await;
+            socket.send(committed("Second segment.")).await.unwrap();
+        })
+        .await;
+        let (session, sink) = session(url, 50);
+        sink.push(&chunk(1));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        sink.push(&chunk(2));
+        drop(sink);
+        assert_eq!(
+            session.finish(Duration::from_secs(3)).await.unwrap(),
+            "First segment. Second segment."
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ending_without_a_committed_transcript_fails_without_partial_text() {
+        for close in [true, false] {
+            let (url, server) = server(true, move |mut socket| async move {
+                until_commit(&mut socket).await;
+                socket.send(partial("partial words")).await.unwrap();
+                if close {
+                    socket.close(None).await.unwrap();
+                }
+            })
+            .await;
+            let (session, sink) = session(url, 50);
+            sink.push(&chunk(1));
+            drop(sink);
+            let error = session.finish(Duration::from_secs(3)).await.unwrap_err();
+            assert_eq!(reason(&error), "disconnected");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_hits_the_finalize_deadline() {
+        let (url, server) = server(true, |mut socket| async move {
+            until_commit(&mut socket).await;
+            socket.send(partial("partial")).await.unwrap();
+            while socket.next().await.is_some() {}
+        })
+        .await;
+        let (session, sink) = session(url, 50);
+        sink.push(&chunk(1));
+        drop(sink);
+        let error = session
+            .finish(Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "finalize_timeout");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_errors_are_classified_without_the_key_or_server_text() {
+        let cases = [
+            ("auth_error", "auth"),
+            ("rate_limited", "rate_limited"),
+            ("quota_exceeded", "rate_limited"),
+            ("commit_throttled", "rate_limited"),
+            ("invalid_request", "provider_error"),
+            ("transcriber_error", "provider_error"),
+        ];
+        for (message_type, expected) in cases {
+            let (url, server) = server(false, move |mut socket| async move {
+                socket
+                    .send(event(serde_json::json!({"message_type": message_type, "error": format!("bad key {KEY}")})))
+                    .await
+                    .unwrap();
+            })
+            .await;
+            let (session, sink) = session(url, 50);
+            sink.push(&chunk(1));
+            drop(sink);
+            let error = session.finish(Duration::from_secs(3)).await.unwrap_err();
+            assert_eq!(reason(&error), expected, "{message_type}");
+            assert!(!format!("{error:?}").contains(KEY));
+            assert!(!format!("{error:?}").contains("bad key"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_after_session_start_fails_the_session() {
+        let (url, server) = server(true, |mut socket| async move {
+            socket.next().await;
+            socket
+                .send(event(
+                    serde_json::json!({"message_type": "error", "error": "boom"}),
+                ))
+                .await
+                .unwrap();
+        })
+        .await;
+        let (session, sink) = session(url, 50);
+        sink.push(&chunk(1));
+        let error = session.finish(Duration::from_secs(3)).await.unwrap_err();
+        assert_eq!(reason(&error), "provider_error");
+        drop(sink);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_handshakes_are_classified() {
+        for (status, expected) in [
+            ("401 Unauthorized", "auth"),
+            ("429 Too Many Requests", "rate_limited"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let (mut connection, _) = listener.accept().await.unwrap();
+                connection
+                    .write_all(format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let (session, sink) = session(format!("ws://{address}/"), 50);
+            drop(sink);
+            let error = session.finish(Duration::from_secs(3)).await.unwrap_err();
+            assert_eq!(reason(&error), expected);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_closes_the_socket_without_committing() {
+        let (heard_sender, heard) = tokio::sync::oneshot::channel();
+        let (url, server) = server(true, |mut socket| async move {
+            assert!(matches!(socket.next().await, Some(Ok(Message::Text(_)))));
+            heard_sender.send(()).unwrap();
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(Message::Text(text))) => assert!(!text.contains("\"commit\":true")),
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        let (session, sink) = session(url, 50);
+        sink.push(&chunk(1));
+        heard.await.unwrap();
+        drop(session);
+        sink.push(&chunk(2));
+        assert!(sink.stopped.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

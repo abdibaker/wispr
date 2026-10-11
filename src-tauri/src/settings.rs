@@ -208,6 +208,8 @@ pub mod secret {
     pub const ROUTER: &str = "9router-api-key";
     /// Meta Model API key for the default Muse provider; Muse has no token broker.
     pub const MUSE: &str = "meta-muse-api-key";
+    /// ElevenLabs key for the experimental Scribe provider.
+    pub const ELEVENLABS: &str = "elevenlabs-api-key";
     /// Groq key for direct cleanup, bypassing 9Router.
     pub const GROQ: &str = "groq-api-key";
 
