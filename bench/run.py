@@ -12,7 +12,7 @@
 Reads endpoint from ~/.config/voice-prompt/settings.json and the key from the keyring
 (or $VP_KEY). Writes JSON results under bench/results/. Stdlib only.
 """
-import argparse, concurrent.futures, ctypes, functools, hashlib, http.client, json, os, pathlib, re, ssl, statistics
+import argparse, concurrent.futures, ctypes, functools, hashlib, http.client, json, os, pathlib, re, signal, ssl, statistics
 import subprocess, sys, tempfile, threading, time, urllib.parse, uuid, wave
 from evaluate import evaluate, has_span
 
@@ -295,7 +295,11 @@ def stt_cases(args):
     missing = [c["id"] for c in cases if not audio_path(c).exists()]
     if missing:
         print(f"skipping {len(missing)} unrecorded clips (run.py record): {' '.join(missing)}", file=sys.stderr)
-    return [c for c in cases if audio_path(c).exists()]
+    cases = [c for c in cases if audio_path(c).exists()]
+    cut = [c["id"] for c in cases if c["kind"] == "author" and cut_off(audio_path(c))]
+    if cut:
+        print(f"ends mid-speech, re-record with `run.py record --again --case {' '.join(cut)}`", file=sys.stderr)
+    return cases
 
 
 def stt_live(args):
@@ -368,6 +372,19 @@ def report_stt_live(records, cases):
             print(f"  {r['case']}: WER {r['wer']}, missed {r['missed']}: {r['text'][:120]}")
 
 
+def cut_off(path):
+    """True when the clip ends in speech: the last 200 ms are well above the room's noise floor.
+    ponytail: energy heuristic; misses a clip cut during a soft consonant."""
+    with wave.open(str(path)) as w:
+        frames = w.readframes(w.getnframes())
+        rate = w.getframerate()
+    samples = memoryview(frames).cast("h")
+    step = rate // 20  # 50 ms
+    rms = [(sum(x * x for x in samples[i:i + step]) / step) ** 0.5 for i in range(0, len(samples) - step + 1, step)]
+    floor = sorted(rms)[len(rms) // 10] or 1
+    return max(rms[-4:]) > 2 * floor
+
+
 def record(args):
     """Records the author's pending core clips: 16 kHz mono, push Enter to start and stop."""
     pending = [c for c in CORPUS["stt"] if c.get("core") and (args.again or not audio_path(c).exists())
@@ -376,11 +393,15 @@ def record(args):
         path = audio_path(case)
         print(f"\n{case['id']}: say naturally{' (' + case['note'] + ')' if case.get('note') else ''}:\n  {case['reference']}")
         input("  Enter to start recording... ")
-        proc = subprocess.Popen(["parecord", "--rate=16000", "--channels=1", "--format=s16le", "--file-format=wav",
-                                 str(path)])
+        # Small fragments and SIGINT: parecord buffers ~2 s and SIGTERM drops the unwritten tail.
+        proc = subprocess.Popen(["parecord", "--latency-msec=50", "--rate=16000", "--channels=1", "--format=s16le",
+                                 "--file-format=wav", str(path)])
         input("  recording; Enter to stop ")
-        proc.terminate()
+        time.sleep(0.4)  # people release Enter as the last word ends
+        proc.send_signal(signal.SIGINT)
         proc.wait()
+        if cut_off(path):
+            print("  the clip ends mid-speech; pause a moment before Enter and record it again (--again --case)")
         print(f"  wrote {path.relative_to(ROOT)}. If you said it differently, edit its reference in corpus.json.")
 
 
