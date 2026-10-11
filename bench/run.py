@@ -2,6 +2,8 @@
 """Reproducible STT and cleanup benchmarks. See bench/README.md.
 
   python3 bench/run.py cleanup [--suite smoke]    # stored transcripts -> cleanup -> evaluator
+  python3 bench/run.py stt-live [--provider muse] # fixed audio -> live STT, no cleanup
+  python3 bench/run.py record                     # record the author's core STT clips
   python3 bench/run.py synth                      # (re)generate synthetic clips
   python3 bench/run.py stt [--trials 3]           # batch Whisper models x vocabulary hints
   python3 bench/run.py latency LOG                # p50/p95 per stage from voice-prompt.log
@@ -12,7 +14,7 @@ Reads endpoint from ~/.config/voice-prompt/settings.json and the key from the ke
 """
 import argparse, concurrent.futures, ctypes, functools, hashlib, http.client, json, os, pathlib, re, ssl, statistics
 import subprocess, sys, tempfile, threading, time, urllib.parse, uuid, wave
-from evaluate import evaluate
+from evaluate import evaluate, has_span
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -285,6 +287,101 @@ def report_stt(records):
             print(f"{model:32} {hint_name:10} {lat['n']:>3} {lat['p50']:>6} {lat['p95']:>6} "
                   f"{statistics.mean(real) if real else 0:>9.3f} {statistics.mean(synth_) if synth_ else 0:>9.3f} "
                   f"{hit:>3}/{total:<3} {errors:>6} {contaminated:>6}")
+
+
+def stt_cases(args):
+    cases = [c for c in CORPUS["stt"] if (args.kind is None or c["kind"] in args.kind)
+             and (not args.core or c.get("core")) and (not args.case or c["id"] in args.case)]
+    missing = [c["id"] for c in cases if not audio_path(c).exists()]
+    if missing:
+        print(f"skipping {len(missing)} unrecorded clips (run.py record): {' '.join(missing)}", file=sys.stderr)
+    return [c for c in cases if audio_path(c).exists()]
+
+
+def stt_live(args):
+    """Fixed audio -> live STT through the app's own streaming code (examples/stt.rs), at real
+    time, no cleanup. Latency: `first_partial` from the first audio sent, `release_to_final`
+    from the last chunk to the provider's confirmed final transcript."""
+    cases = stt_cases(args)
+    if not cases:
+        sys.exit("no recorded clips match")
+    binary = ROOT / "src-tauri/target/debug/examples/stt"
+    if not binary.exists():
+        sys.exit("build it first: cd src-tauri && cargo build --example stt")
+    jobs = []
+    for trial in range(args.trials):
+        for case in cases:
+            # The app sends keyterms only into technical windows; the core corpus is mixed.
+            terms = CORPUS["vocabulary"]["extended"] if args.keyterms and case["terms"] else []
+            jobs.append({"id": f"{case['id']}#{trial}", "audio": str(audio_path(case)), "keyterms": terms})
+    out = subprocess.run([str(binary), args.provider, str(args.concurrency)], input=json.dumps(jobs),
+                         capture_output=True, text=True, timeout=600)
+    by_id = {c["id"]: c for c in cases}
+    records = []
+    for line in out.stdout.splitlines():
+        r = json.loads(line)
+        case = by_id[r["id"].split("#")[0]]
+        r.update(case=case["id"], kind=case["kind"], provider=args.provider)
+        if r.get("text") is not None:
+            r["wer"] = round(wer(case["reference"], r["text"]), 3)
+            # "three" counts for "3"; other terms must match their written form (case aside).
+            r["missed"] = [t for t in case["terms"] if not contains(r["text"], t, case=False)
+                           and not (t.isdigit() and has_span(r["text"], t))]
+            subs, dels, ins = alignment(case["reference"], r["text"])
+            r["omitted"] = dels
+        records.append(r)
+    if out.returncode:
+        print(out.stderr[-2000:], file=sys.stderr)
+    write(f"stt-{args.provider}", records)
+    report_stt_live(records, cases)
+
+
+def report_stt_live(records, cases):
+    """Real voice and synthetic speech never share a row."""
+    print(f"\n{'provider':9} {'kind':9} {'n':>3} {'WER':>6} {'terms':>7} {'numbers':>7} {'omit':>4} "
+          f"{'partial50':>9} {'final50':>7} {'final95':>7} {'fail':>4}")
+    for kind in ("author", "librivox", "neural", "espeak"):
+        group = [r for r in records if r["kind"] == kind]
+        if not group:
+            continue
+        ok = [r for r in group if r.get("text") is not None]
+        terms = [t for c in cases if c["kind"] == kind for t in c["terms"]]
+        trials = len(group) // max(1, len({r["case"] for r in group}))
+        missed = sum(len(r["missed"]) for r in ok)
+        numbers = [t for c in cases if c["kind"] == kind for t in c["terms"] if any(ch.isdigit() for ch in t)]
+        missed_numbers = sum(1 for r in ok for t in r["missed"] if any(ch.isdigit() for ch in t))
+        partial = summary([r["first_partial_ms"] for r in ok if r.get("first_partial_ms") is not None])
+        final = summary([r["release_to_final_ms"] for r in ok])
+        print(f"{group[0]['provider']:9} {kind:9} {len(group):>3} {statistics.mean(r['wer'] for r in ok) if ok else 0:>6.3f} "
+              f"{len(terms) * trials - missed:>3}/{len(terms) * trials:<3} "
+              f"{len(numbers) * trials - missed_numbers:>3}/{len(numbers) * trials:<3} "
+              f"{sum(len(r['omitted']) for r in ok):>4} {partial['p50'] or '-':>9} {final['p50'] or '-':>7} "
+              f"{final['p95'] or '-':>7} {len(group) - len(ok):>4}")
+    failures = {}
+    for r in records:
+        if r.get("text") is None:
+            failures[r.get("error")] = failures.get(r.get("error"), 0) + 1
+    if failures:
+        print("failures: " + ", ".join(f"{k}={v}" for k, v in failures.items()))
+    for r in sorted(records, key=lambda r: r["case"]):
+        if r.get("missed") or (r.get("wer") or 0) > 0.15:
+            print(f"  {r['case']}: WER {r['wer']}, missed {r['missed']}: {r['text'][:120]}")
+
+
+def record(args):
+    """Records the author's pending core clips: 16 kHz mono, push Enter to start and stop."""
+    pending = [c for c in CORPUS["stt"] if c.get("core") and (args.again or not audio_path(c).exists())
+               and (not args.case or c["id"] in args.case)]
+    for case in pending:
+        path = audio_path(case)
+        print(f"\n{case['id']}: say naturally{' (' + case['note'] + ')' if case.get('note') else ''}:\n  {case['reference']}")
+        input("  Enter to start recording... ")
+        proc = subprocess.Popen(["parecord", "--rate=16000", "--channels=1", "--format=s16le", "--file-format=wav",
+                                 str(path)])
+        input("  recording; Enter to stop ")
+        proc.terminate()
+        proc.wait()
+        print(f"  wrote {path.relative_to(ROOT)}. If you said it differently, edit its reference in corpus.json.")
 
 
 # ---------- cleanup ----------
@@ -709,6 +806,19 @@ def main():
     p.add_argument("--cold", action="store_true", help="new connection per request")
     p.add_argument("--pace", type=float, default=3.5, help="seconds between requests (rate limit)")
     p.set_defaults(run=stt)
+    p = sub.add_parser("stt-live", help="fixed audio -> live STT (the app's streaming code), no cleanup")
+    p.add_argument("--provider", choices=["muse", "deepgram"], default="muse")
+    p.add_argument("--kind", nargs="*", choices=["author", "librivox", "neural", "espeak"], help="default: all")
+    p.add_argument("--core", action="store_true", help="the author's core clips only")
+    p.add_argument("--case", nargs="*")
+    p.add_argument("--keyterms", action="store_true", help="send the extended vocabulary for technical clips")
+    p.add_argument("--trials", type=int, default=1)
+    p.add_argument("--concurrency", type=int, default=4)
+    p.set_defaults(run=stt_live)
+    p = sub.add_parser("record", help="record the author's pending core STT clips")
+    p.add_argument("--case", nargs="*")
+    p.add_argument("--again", action="store_true", help="re-record existing clips")
+    p.set_defaults(run=record)
     p = sub.add_parser("cleanup", help="stored transcripts -> cleanup provider -> evaluator")
     p.add_argument("--suite", choices=sorted(SUITES), default="smoke",
                    help="smoke: ~13 dev cases; dev: prompt-dev; holdout: never tune on it; full: both")
