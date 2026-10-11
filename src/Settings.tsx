@@ -11,17 +11,9 @@ type SettingsData = {
   sounds: boolean;
   microphone: string;
   endpoint: string;
-  stt_model: string;
   language: string;
   streaming: boolean;
-  streaming_model: string;
-  streaming_provider: "deepgram" | "muse" | "scribe";
   cleanup_enabled: boolean;
-  cleanup_provider: "router" | "groq";
-  cleanup_model: string;
-  reasoning_effort: string;
-  cleanup_fallback_model: string;
-  cleanup_instructions: string;
   vocabulary: string[];
   history_enabled: boolean;
   history_retention_days: number;
@@ -196,87 +188,68 @@ function General({ settings, update }: SectionProps) {
   );
 }
 
+type Test = { ok: boolean; text: string } | null;
+
+/** A password field for one keyring entry: Save replaces it, Remove (empty field) deletes it. */
+function KeyRow({ label, missing, placeholder, has, save }: { label: string; missing: string; placeholder: string; has: boolean; save: (key: string) => void }) {
+  const [key, setKey] = useState("");
+  const submit = () => {
+    save(key);
+    setKey("");
+  };
+  return (
+    <Row label={label} hint={has ? "Stored in the system keyring. Enter a new one to replace it." : missing}>
+      <span className="inline">
+        <input
+          type="password"
+          autoComplete="off"
+          placeholder={has ? "••••••••" : placeholder}
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+        />
+        <button onClick={submit} disabled={!key && !has}>
+          {key || !has ? "Save" : "Remove"}
+        </button>
+      </span>
+    </Row>
+  );
+}
+
+/** Runs a check command and shows its result. */
+function useTest(): [Test, boolean, (command: string) => Promise<void>, (test: Test) => void] {
+  const [test, setTest] = useState<Test>(null);
+  const [testing, setTesting] = useState(false);
+  const run = async (command: string) => {
+    setTesting(true);
+    try {
+      setTest({ ok: true, text: await invoke<string>(command) });
+    } catch (error) {
+      setTest({ ok: false, text: String(error) });
+    } finally {
+      setTesting(false);
+    }
+  };
+  return [test, testing, run, setTest];
+}
+
 function Speech({ settings, update }: SectionProps) {
   const [microphones, setMicrophones] = useState<Microphone[]>([]);
-  const [hasKey, setHasKey] = useState(false);
-  const [key, setKey] = useState("");
-  const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null);
-  const [testing, setTesting] = useState(false);
   const [hasMuseKey, setHasMuseKey] = useState(false);
-  const [museKey, setMuseKey] = useState("");
-  const [hasScribeKey, setHasScribeKey] = useState(false);
-  const [scribeKey, setScribeKey] = useState("");
+  const [test, testing, run, setTest] = useTest();
 
   useEffect(() => {
     invoke<Microphone[]>("list_microphones").then(setMicrophones).catch(() => setMicrophones([]));
-    invoke<boolean>("has_api_key").then(setHasKey).catch(() => setHasKey(false));
     invoke<boolean>("has_muse_key").then(setHasMuseKey).catch(() => setHasMuseKey(false));
-    invoke<boolean>("has_elevenlabs_key").then(setHasScribeKey).catch(() => setHasScribeKey(false));
   }, []);
 
-  const saveMuseKey = async () => {
+  const saveMuseKey = async (key: string) => {
     try {
-      await invoke("set_muse_key", { key: museKey });
-      setMuseKey("");
-      setHasMuseKey(museKey.trim().length > 0);
-      setTest({ ok: true, text: museKey.trim() ? "Meta Muse key saved to the system keyring." : "Meta Muse key removed." });
+      await invoke("set_muse_key", { key });
+      setHasMuseKey(key.trim().length > 0);
+      setTest({ ok: true, text: key.trim() ? "Meta Muse key saved to the system keyring." : "Meta Muse key removed." });
     } catch (error) {
       setTest({ ok: false, text: String(error) });
-    }
-  };
-
-  const testMuse = async () => {
-    setTesting(true);
-    try {
-      setTest({ ok: true, text: await invoke<string>("test_muse") });
-    } catch (error) {
-      setTest({ ok: false, text: String(error) });
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  const saveScribeKey = async () => {
-    try {
-      await invoke("set_elevenlabs_key", { key: scribeKey });
-      setScribeKey("");
-      setHasScribeKey(scribeKey.trim().length > 0);
-      setTest({ ok: true, text: scribeKey.trim() ? "ElevenLabs key saved to the system keyring." : "ElevenLabs key removed." });
-    } catch (error) {
-      setTest({ ok: false, text: String(error) });
-    }
-  };
-
-  const testScribe = async () => {
-    setTesting(true);
-    try {
-      setTest({ ok: true, text: await invoke<string>("test_elevenlabs") });
-    } catch (error) {
-      setTest({ ok: false, text: String(error) });
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  const saveKey = async () => {
-    try {
-      await invoke("set_api_key", { key });
-      setKey("");
-      setHasKey(key.trim().length > 0);
-      setTest({ ok: true, text: key.trim() ? "Key saved to the system keyring." : "Key removed." });
-    } catch (error) {
-      setTest({ ok: false, text: String(error) });
-    }
-  };
-
-  const runTest = async () => {
-    setTesting(true);
-    try {
-      setTest({ ok: true, text: await invoke<string>("test_connection") });
-    } catch (error) {
-      setTest({ ok: false, text: String(error) });
-    } finally {
-      setTesting(false);
     }
   };
 
@@ -293,79 +266,16 @@ function Speech({ settings, update }: SectionProps) {
           ))}
         </select>
       </Row>
-      <Row label="9Router endpoint" hint="OpenAI-compatible base URL.">
-        <Text value={settings.endpoint} onSave={(endpoint) => update({ endpoint })} spellCheck={false} />
-      </Row>
-      <Row label="API key" hint={hasKey ? "Stored in the system keyring. Enter a new one to replace it." : "Not set."}>
-        <span className="inline">
-          <input
-            type="password"
-            autoComplete="off"
-            placeholder={hasKey ? "••••••••" : "sk-…"}
-            value={key}
-            onChange={(e) => setKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && saveKey()}
-          />
-          <button onClick={saveKey} disabled={!key && !hasKey}>
-            {key || !hasKey ? "Save" : "Remove"}
-          </button>
-        </span>
-      </Row>
-      <Row label="Speech-to-text model">
-        <Text value={settings.stt_model} onSave={(stt_model) => update({ stt_model })} spellCheck={false} />
-      </Row>
       <Row label="Language" hint="ISO code such as en, or auto.">
         <Text value={settings.language} onSave={(language) => update({ language })} spellCheck={false} />
       </Row>
-      <Row label="Live transcription" hint="Streams audio while you speak. The model above is the fallback.">
+      <Row label="Live transcription" hint="Streams audio to Meta Muse while you speak. Off, or if Muse fails, the recording goes to Whisper through 9Router.">
         <Toggle checked={settings.streaming} onChange={(streaming) => update({ streaming })} />
       </Row>
-      <Row label="Live transcription provider">
-        <select value={settings.streaming_provider} onChange={(e) => update({ streaming_provider: e.target.value as SettingsData["streaming_provider"] })}>
-          <option value="muse">Meta Muse Voice Transcribe</option>
-          <option value="scribe">ElevenLabs Scribe v2 Realtime (experimental)</option>
-          <option value="deepgram">Deepgram Nova-3</option>
-        </select>
-      </Row>
-      <Row label="Meta Muse API key" hint={hasMuseKey ? "Stored in the system keyring. Enter a new one to replace it." : "Not set. Only needed for Meta Muse."}>
-        <span className="inline">
-          <input
-            type="password"
-            autoComplete="off"
-            placeholder={hasMuseKey ? "••••••••" : "LLM_…"}
-            value={museKey}
-            onChange={(e) => setMuseKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && saveMuseKey()}
-          />
-          <button onClick={saveMuseKey} disabled={!museKey && !hasMuseKey}>
-            {museKey || !hasMuseKey ? "Save" : "Remove"}
-          </button>
-        </span>
-      </Row>
-      <Row label="ElevenLabs API key" hint={hasScribeKey ? "Stored in the system keyring. Enter a new one to replace it." : "Not set. Only needed for ElevenLabs Scribe."}>
-        <span className="inline">
-          <input
-            type="password"
-            autoComplete="off"
-            placeholder={hasScribeKey ? "••••••••" : "sk_…"}
-            value={scribeKey}
-            onChange={(e) => setScribeKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && saveScribeKey()}
-          />
-          <button onClick={saveScribeKey} disabled={!scribeKey && !hasScribeKey}>
-            {scribeKey || !hasScribeKey ? "Save" : "Remove"}
-          </button>
-        </span>
-      </Row>
+      <KeyRow label="Meta Muse API key" missing="Not set. Needed for live transcription." placeholder="LLM_…" has={hasMuseKey} save={saveMuseKey} />
       <div className="actions">
-        <button onClick={runTest} disabled={testing}>
-          {testing ? "Testing…" : "Test connection"}
-        </button>
-        <button onClick={testMuse} disabled={testing || !hasMuseKey}>
-          Test Muse
-        </button>
-        <button onClick={testScribe} disabled={testing || !hasScribeKey}>
-          Test ElevenLabs
+        <button onClick={() => run("test_muse")} disabled={testing || !hasMuseKey}>
+          {testing ? "Testing…" : "Test Muse"}
         </button>
         {test ? <span className={test.ok ? "ok" : "error"}>{test.text}</span> : null}
       </div>
@@ -374,102 +284,44 @@ function Speech({ settings, update }: SectionProps) {
 }
 
 function Cleanup({ settings, update }: SectionProps) {
-  const [hasGroqKey, setHasGroqKey] = useState(false);
-  const [groqKey, setGroqKey] = useState("");
-  const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null);
-  const [testing, setTesting] = useState(false);
+  const [hasKey, setHasKey] = useState(false);
+  const [test, testing, run, setTest] = useTest();
 
   useEffect(() => {
-    invoke<boolean>("has_groq_key").then(setHasGroqKey).catch(() => setHasGroqKey(false));
+    invoke<boolean>("has_api_key").then(setHasKey).catch(() => setHasKey(false));
   }, []);
 
-  const saveGroqKey = async () => {
+  const saveKey = async (key: string) => {
     try {
-      await invoke("set_groq_key", { key: groqKey });
-      setGroqKey("");
-      setHasGroqKey(groqKey.trim().length > 0);
-      setTest({ ok: true, text: groqKey.trim() ? "Groq key saved to the system keyring." : "Groq key removed." });
+      await invoke("set_api_key", { key });
+      setHasKey(key.trim().length > 0);
+      setTest({ ok: true, text: key.trim() ? "Key saved to the system keyring." : "Key removed." });
     } catch (error) {
       setTest({ ok: false, text: String(error) });
     }
-  };
-
-  const testGroq = async () => {
-    setTesting(true);
-    try {
-      setTest({ ok: true, text: await invoke<string>("test_groq") });
-    } catch (error) {
-      setTest({ ok: false, text: String(error) });
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  // 9Router names Groq models "groq/<id>"; Groq itself uses the bare id.
-  const setProvider = (cleanup_provider: SettingsData["cleanup_provider"]) => {
-    const model = settings.cleanup_model;
-    const cleanup_model =
-      cleanup_provider === "groq" ? model.replace(/^groq\//, "") : model.includes("/") && !model.startsWith("groq/") ? `groq/${model}` : model;
-    update({ cleanup_provider, cleanup_model });
   };
 
   return (
     <section>
       <h1>Prompt cleanup</h1>
+      <p className="lead">
+        Claude Haiku 5.5 makes the fewest edits that turn speech into written text: it removes fillers and false starts,
+        applies spoken corrections, and fixes punctuation, numbers and technical spellings. It never summarizes or
+        rewrites.
+      </p>
       <Row label="Clean up prompts" hint="Off: insert the raw transcript.">
         <Toggle checked={settings.cleanup_enabled} onChange={(cleanup_enabled) => update({ cleanup_enabled })} />
       </Row>
-      <Row label="Provider" hint="Groq direct needs a Groq key; without one, cleanup goes through 9Router.">
-        <select value={settings.cleanup_provider} onChange={(e) => setProvider(e.target.value as SettingsData["cleanup_provider"])}>
-          <option value="router">9Router</option>
-          <option value="groq">Groq direct</option>
-        </select>
+      <Row label="9Router endpoint" hint="OpenAI-compatible base URL, also used for the batch fallback.">
+        <Text value={settings.endpoint} onSave={(endpoint) => update({ endpoint })} spellCheck={false} />
       </Row>
-      <Row label="Model" hint={settings.cleanup_provider === "groq" ? "Groq model id, e.g. openai/gpt-oss-20b." : "9Router model, e.g. groq/openai/gpt-oss-20b."}>
-        <Text value={settings.cleanup_model} onSave={(cleanup_model) => update({ cleanup_model })} spellCheck={false} />
-      </Row>
-      <Row label="Reasoning effort" hint="GPT-OSS takes low, medium or high; none omits the field.">
-        <select value={settings.reasoning_effort} onChange={(e) => update({ reasoning_effort: e.target.value })}>
-          {["none", "low", "medium", "high"].map((effort) => (
-            <option key={effort}>{effort}</option>
-          ))}
-        </select>
-      </Row>
-      <Row label="Fallback model" hint="Tried once through 9Router if the model above fails. Empty: insert the raw transcript.">
-        <Text value={settings.cleanup_fallback_model} onSave={(cleanup_fallback_model) => update({ cleanup_fallback_model })} spellCheck={false} />
-      </Row>
-      <Row label="Groq API key" hint={hasGroqKey ? "Stored in the system keyring. Enter a new one to replace it." : "Not set. Only needed for Groq direct."}>
-        <span className="inline">
-          <input
-            type="password"
-            autoComplete="off"
-            placeholder={hasGroqKey ? "••••••••" : "gsk_…"}
-            value={groqKey}
-            onChange={(e) => setGroqKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && saveGroqKey()}
-          />
-          <button onClick={saveGroqKey} disabled={!groqKey && !hasGroqKey}>
-            {groqKey || !hasGroqKey ? "Save" : "Remove"}
-          </button>
-        </span>
-      </Row>
+      <KeyRow label="9Router API key" missing="Not set. Needed for cleanup and the batch fallback." placeholder="sk-…" has={hasKey} save={saveKey} />
       <div className="actions">
-        <button onClick={testGroq} disabled={testing || !hasGroqKey}>
-          {testing ? "Testing…" : "Test Groq"}
+        <button onClick={() => run("test_connection")} disabled={testing || !hasKey}>
+          {testing ? "Testing…" : "Test connection"}
         </button>
         {test ? <span className={test.ok ? "ok" : "error"}>{test.text}</span> : null}
       </div>
-      <Row
-        label="Extra instructions"
-        hint="Optional. Cleanup is always conservative: it removes fillers and false starts, applies self-corrections, fixes grammar, and never adds requirements."
-      >
-        <textarea
-          rows={4}
-          defaultValue={settings.cleanup_instructions}
-          placeholder="e.g. Use British spelling."
-          onBlur={(e) => e.target.value !== settings.cleanup_instructions && update({ cleanup_instructions: e.target.value })}
-        />
-      </Row>
     </section>
   );
 }
@@ -631,7 +483,7 @@ function Advanced({ settings, update }: SectionProps) {
       <Row label="Debug logging" hint="Adds timing details. Prompt text is never logged.">
         <Toggle checked={settings.debug_logging} onChange={(debug_logging) => update({ debug_logging })} />
       </Row>
-      <Row label="Transcription timeout (s)">
+      <Row label="Batch fallback timeout (s)" hint="Whisper through 9Router, used when Muse fails.">
         <NumberInput min={5} value={settings.stt_timeout_secs} onSave={(stt_timeout_secs) => update({ stt_timeout_secs })} />
       </Row>
       <Row label="Cleanup timeout (s)" hint="On timeout the raw transcript is inserted.">

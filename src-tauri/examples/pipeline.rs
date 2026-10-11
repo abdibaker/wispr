@@ -1,6 +1,6 @@
 //! Manual end-to-end check through the app's pipeline, with the app's settings and keyring key:
 //! `cargo run --example pipeline -- audio.wav [--type]`. Without `--type` the result is copied.
-//! `VP_CLEANUP_MODEL` overrides the cleanup model. Uses a throwaway history.
+//! Uses a throwaway history.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use voice_prompt::pipeline::{Pipeline, Recording, Snapshot};
@@ -11,16 +11,12 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let samples = wav_samples(&std::fs::read(&args[1])?)?;
     let mut settings = settings::load(&settings::config_dir());
-    if let Ok(model) = std::env::var("VP_CLEANUP_MODEL") {
-        settings.cleanup_model = model;
-    }
     settings.auto_insert = args.iter().any(|a| a == "--type");
     let dir = tempfile::tempdir()?;
     let client = reqwest::Client::new();
     let connect = Box::new(move |settings: &settings::Settings| {
         let key = settings::secret::get()?.ok_or_else(|| anyhow::anyhow!("no API key"))?;
-        let groq = settings::secret::get_for(settings::secret::GROQ)?;
-        Ok(providers::connect(client.clone(), settings, key, groq))
+        Ok(providers::connect(client.clone(), settings, key))
     });
     let desktop = delivery::System {
         windows: None,

@@ -19,21 +19,13 @@ pub struct Settings {
     pub sounds: bool,
     // Speech
     pub microphone: String,
+    /// 9Router base URL, for cleanup and the batch fallback.
     pub endpoint: String,
-    pub stt_model: String,
     pub language: String,
-    /// Stream audio live while the key is held; batch STT stays the fallback.
+    /// Stream audio live to Muse while the key is held; batch Whisper stays the fallback.
     pub streaming: bool,
-    pub streaming_model: String,
-    pub streaming_provider: StreamingProvider,
     // Cleanup
     pub cleanup_enabled: bool,
-    pub cleanup_provider: CleanupProvider,
-    pub cleanup_model: String,
-    pub reasoning_effort: String,
-    /// Tried through 9Router when the cleanup model fails; empty: none.
-    pub cleanup_fallback_model: String,
-    pub cleanup_instructions: String,
     // Vocabulary
     pub vocabulary: Vec<String>,
     // History
@@ -48,26 +40,6 @@ pub struct Settings {
     pub max_record_secs: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum StreamingProvider {
-    Muse,
-    /// Experimental: ElevenLabs Scribe v2 Realtime.
-    Scribe,
-    /// Also any unknown value, as before typed settings.
-    #[serde(other)]
-    Deepgram,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum CleanupProvider {
-    /// api.groq.com with its own key.
-    Groq,
-    #[serde(other)]
-    Router,
-}
-
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -79,20 +51,9 @@ impl Default for Settings {
             sounds: true,
             microphone: String::new(),
             endpoint: "https://llm.abdibaker.com/v1".into(),
-            // ponytail: spec's groq/distil-whisper-large-v3-en is decommissioned upstream.
-            stt_model: "groq/whisper-large-v3-turbo".into(),
             language: "en".into(),
             streaming: true,
-            streaming_model: "nova-3".into(),
-            // Beat Deepgram on latency, WER and term accuracy (bench/results/e2e-muse-*).
-            streaming_provider: StreamingProvider::Muse,
             cleanup_enabled: true,
-            cleanup_provider: CleanupProvider::Router,
-            // Passes the cleanup corpus at a quarter of Haiku's latency (bench/results, 2026-10-10).
-            cleanup_model: "groq/openai/gpt-oss-20b".into(),
-            reasoning_effort: "low".into(),
-            cleanup_fallback_model: "claude-haiku-5-5".into(),
-            cleanup_instructions: String::new(),
             vocabulary: [
                 "9Router",
                 "T3 Code",
@@ -204,14 +165,10 @@ pub fn apply_autostart(enabled: bool) -> Result<()> {
 pub mod secret {
     use anyhow::Result;
     const SERVICE: &str = "voice-prompt";
-    /// The 9Router key, which also mints Deepgram tokens.
+    /// The 9Router key: Haiku cleanup and the batch Whisper fallback.
     pub const ROUTER: &str = "9router-api-key";
-    /// Meta Model API key for the default Muse provider; Muse has no token broker.
+    /// Meta Model API key for live Muse transcription; Muse has no token broker.
     pub const MUSE: &str = "meta-muse-api-key";
-    /// ElevenLabs key for the experimental Scribe provider.
-    pub const ELEVENLABS: &str = "elevenlabs-api-key";
-    /// Groq key for direct cleanup, bypassing 9Router.
-    pub const GROQ: &str = "groq-api-key";
 
     fn entry(account: &str) -> Result<keyring::Entry> {
         Ok(keyring::Entry::new(SERVICE, account)?)
@@ -403,36 +360,38 @@ mod tests {
         let settings = load(dir.path());
         assert_eq!(settings.language, "de");
         assert_eq!(settings.shortcut, "Ctrl+Super");
-        assert_eq!(settings.streaming_provider, StreamingProvider::Muse);
         assert!(settings.streaming);
     }
 
     #[test]
-    fn choices_read_old_files_and_unknown_values() {
+    fn old_files_load_and_drop_retired_fields() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("settings.json");
+        // A settings file from the provider-comparison builds.
         fs::write(
             &file,
-            r#"{"streaming_provider":"muse","insertion_method":"paste-terminal"}"#,
-        )
-        .unwrap();
-        let settings = load(dir.path());
-        assert_eq!(settings.streaming_provider, StreamingProvider::Muse);
-        assert_eq!(settings.insertion_method, Method::PasteTerminal);
-        // Unknown values fall back per field, as the string settings did, not to all defaults.
-        fs::write(
-            &file,
-            r#"{"language":"de","streaming_provider":"other","insertion_method":"bogus"}"#,
+            r#"{"language":"de","streaming_provider":"deepgram","cleanup_model":"groq/openai/gpt-oss-120b",
+                "reasoning_effort":"low","cleanup_instructions":"British spelling","insertion_method":"paste-terminal"}"#,
         )
         .unwrap();
         let settings = load(dir.path());
         assert_eq!(settings.language, "de");
-        assert_eq!(settings.streaming_provider, StreamingProvider::Deepgram);
-        assert_eq!(settings.insertion_method, Method::Type);
+        assert_eq!(settings.insertion_method, Method::PasteTerminal);
         save(dir.path(), &settings).unwrap();
         let saved = fs::read_to_string(&file).unwrap();
-        assert!(saved.contains(r#""streaming_provider": "deepgram""#));
-        assert!(saved.contains(r#""insertion_method": "type""#));
+        for retired in [
+            "streaming_provider",
+            "cleanup_model",
+            "reasoning_effort",
+            "cleanup_instructions",
+        ] {
+            assert!(!saved.contains(retired), "{retired}");
+        }
+        // Unknown values fall back per field, not to all defaults.
+        fs::write(&file, r#"{"language":"de","insertion_method":"bogus"}"#).unwrap();
+        let settings = load(dir.path());
+        assert_eq!(settings.language, "de");
+        assert_eq!(settings.insertion_method, Method::Type);
     }
 
     #[test]

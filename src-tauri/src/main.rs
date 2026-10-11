@@ -130,8 +130,7 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
             let settings = &snapshot.settings;
             // The queue exists before token and connection work starts, so early speech is kept.
             let (stream, sink) = if settings.streaming {
-                let (stream, sink) =
-                    streaming::start(state.client.clone(), settings, snapshot.keyterms());
+                let (stream, sink) = streaming::start(settings, snapshot.keyterms());
                 (Some(stream), Some(sink))
             } else {
                 (None, None)
@@ -279,12 +278,7 @@ fn connect(client: reqwest::Client) -> voice_prompt::pipeline::Connect {
     Box::new(move |settings| {
         let key = settings::secret::get()?
             .ok_or_else(|| anyhow!("No 9Router API key. Open Voice Prompt settings → Speech."))?;
-        // Without a Groq key, Groq cleanup runs through 9Router instead.
-        let groq = match settings.cleanup_provider {
-            settings::CleanupProvider::Groq => settings::secret::get_for(settings::secret::GROQ)?,
-            settings::CleanupProvider::Router => None,
-        };
-        Ok(providers::connect(client.clone(), settings, key, groq))
+        Ok(providers::connect(client.clone(), settings, key))
     })
 }
 
@@ -345,70 +339,6 @@ fn set_muse_key(key: String) -> CommandResult<()> {
     settings::secret::set_for(settings::secret::MUSE, key.trim()).map_err(text_error)
 }
 
-#[tauri::command]
-fn has_elevenlabs_key() -> CommandResult<bool> {
-    settings::secret::get_for(settings::secret::ELEVENLABS)
-        .map(|k| k.is_some())
-        .map_err(text_error)
-}
-
-#[tauri::command]
-fn set_elevenlabs_key(key: String) -> CommandResult<()> {
-    settings::secret::set_for(settings::secret::ELEVENLABS, key.trim()).map_err(text_error)
-}
-
-/// Starts a Scribe session with the stored key, without sending audio.
-#[tauri::command]
-async fn test_elevenlabs() -> CommandResult<String> {
-    let started = Instant::now();
-    streaming::scribe_check().await.map_err(|e| e.to_string())?;
-    Ok(format!(
-        "ElevenLabs accepted the key ({} ms).",
-        started.elapsed().as_millis()
-    ))
-}
-
-#[tauri::command]
-fn has_groq_key() -> CommandResult<bool> {
-    settings::secret::get_for(settings::secret::GROQ)
-        .map(|k| k.is_some())
-        .map_err(text_error)
-}
-
-#[tauri::command]
-fn set_groq_key(key: String) -> CommandResult<()> {
-    settings::secret::set_for(settings::secret::GROQ, key.trim()).map_err(text_error)
-}
-
-/// Checks the stored Groq key and that it can use the cleanup model.
-#[tauri::command]
-async fn test_groq(state: tauri::State<'_, AppState>) -> CommandResult<String> {
-    let model = state.settings.lock().unwrap().cleanup_model.clone();
-    // The 9Router alias `groq/openai/gpt-oss-20b` is `openai/gpt-oss-20b` at Groq.
-    let model = model.strip_prefix("groq/").unwrap_or(&model).to_string();
-    let key = settings::secret::get_for(settings::secret::GROQ)
-        .map_err(text_error)?
-        .ok_or("No Groq key saved")?;
-    let started = Instant::now();
-    let response = state
-        .client
-        .get(format!("{}/models/{model}", providers::GROQ_URL))
-        .bearer_auth(key)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("Cannot reach Groq: {e}"))?;
-    match response.status().as_u16() {
-        200 => Ok(format!(
-            "Groq accepted the key for {model} ({} ms).",
-            started.elapsed().as_millis()
-        )),
-        401 | 403 => Err("Groq rejected the key".into()),
-        404 => Err(format!("Groq has no model '{model}'")),
-        status => Err(format!("Groq returned {status}")),
-    }
-}
-
 /// Handshakes with Muse using the stored key, without sending audio.
 #[tauri::command]
 async fn test_muse() -> CommandResult<String> {
@@ -462,8 +392,8 @@ async fn test_connection(state: tauri::State<'_, AppState>) -> CommandResult<Str
         .filter_map(|m| m["id"].as_str())
         .collect();
     let mut message = format!("Connected in {} ms.", started.elapsed().as_millis());
-    for model in [&settings.stt_model, &settings.cleanup_model] {
-        if !ids.is_empty() && !ids.contains(&model.as_str()) {
+    for model in [providers::STT_MODEL, providers::CLEANUP_MODEL] {
+        if !ids.is_empty() && !ids.contains(&model) {
             message += &format!(" Model '{model}' is not listed by the endpoint.");
         }
     }
@@ -759,12 +689,6 @@ fn main() {
             has_muse_key,
             set_muse_key,
             test_muse,
-            has_elevenlabs_key,
-            set_elevenlabs_key,
-            test_elevenlabs,
-            has_groq_key,
-            set_groq_key,
-            test_groq,
             list_microphones,
             test_connection,
             history_list,
