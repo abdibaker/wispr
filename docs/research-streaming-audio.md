@@ -1,5 +1,7 @@
 # Streaming audio during dictation
 
+> Historical research. The Deepgram and Groq paths described here were removed; the app streams to Meta Muse only (`src-tauri/src/streaming.rs`).
+
 Investigated on 2026-10-05. Native streaming is implemented and locally tested; live 9Router batch transcription is verified. Browser and native realtime-provider acceptance remain unverified.
 
 ## Current bottleneck

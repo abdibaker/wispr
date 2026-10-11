@@ -1,5 +1,7 @@
 # Voice Prompt App Specification
 
+> The original build brief, kept as written. The shipped architecture differs: Meta Muse live transcription, Claude Haiku 5.5 cleanup through 9Router, and batch Whisper as the fallback. See `README.md`.
+
 ## Goal
 
 Build a production-ready Linux voice-prompt desktop app for **Pop!\_OS/COSMIC/Wayland**, similar in interaction to Wispr Flow but specifically for dictating prompts to AI coding agents.
