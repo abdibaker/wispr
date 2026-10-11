@@ -534,6 +534,9 @@ PROVIDERS = {
     "groq-20b": ("groq", "openai/gpt-oss-20b", "low"),
     "router-20b": ("router", "groq/openai/gpt-oss-20b", "low"),
     "router-haiku": ("router", "claude-haiku-5-5", ""),
+    "haiku-off": ("router", "claude-haiku-5-5", "none"),
+    "haiku-low": ("router", "claude-haiku-5-5", "low"),
+    "haiku-medium": ("router", "claude-haiku-5-5", "medium"),
     "groq-120b": ("groq", "openai/gpt-oss-120b", "low"),
 }
 
@@ -625,6 +628,9 @@ def cleanup(args):
             choice = (parsed.get("choices") or [{}])[0]
             result = {**receipt, "finish": choice.get("finish_reason"),
                       "output": (choice.get("message") or {}).get("content"), "usage": parsed.get("usage") or {}}
+            tagged = re.findall(r"<cleaned>(.*?)</cleaned>", result["output"] or "", re.S)
+            if tagged:  # mirror of providers::cleaned_text: the last tagged block wins
+                result["raw"], result["output"] = result["output"], tagged[-1].strip()
             if "error" not in receipt and result["finish"] != "length":
                 CACHE.mkdir(parents=True, exist_ok=True)
                 cached.write_text(json.dumps(result))
