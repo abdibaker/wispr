@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Reproducible STT and cleanup benchmark against the app's 9Router endpoint.
+"""Reproducible STT and cleanup benchmarks. See bench/README.md.
 
-  python3 bench/run.py synth                      # (re)generate synthetic clips with espeak-ng
-  python3 bench/run.py stt [--trials 3]           # STT models x vocabulary hints
-  python3 bench/run.py cleanup [--trials 2]       # cleanup configurations vs raw baseline
+  python3 bench/run.py cleanup [--suite smoke]    # stored transcripts -> cleanup -> evaluator
+  python3 bench/run.py synth                      # (re)generate synthetic clips
+  python3 bench/run.py stt [--trials 3]           # batch Whisper models x vocabulary hints
   python3 bench/run.py latency LOG                # p50/p95 per stage from voice-prompt.log
   python3 bench/run.py e2e-report OUT...          # raw/cleaned accuracy and latency from e2e.sh
 
 Reads endpoint from ~/.config/voice-prompt/settings.json and the key from the keyring
 (or $VP_KEY). Writes JSON results under bench/results/. Stdlib only.
 """
-import argparse, ctypes, http.client, json, os, pathlib, re, ssl, statistics, subprocess
-import sys, tempfile, time, urllib.parse, uuid, wave
+import argparse, concurrent.futures, ctypes, functools, hashlib, http.client, json, os, pathlib, re, ssl, statistics
+import subprocess, sys, tempfile, threading, time, urllib.parse, uuid, wave
+from evaluate import evaluate
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -21,22 +22,11 @@ RESULTS = HERE / "results"
 STT_MODELS = ["groq/whisper-large-v3-turbo", "groq/whisper-large-v3"]
 # Prose clips whose transcripts must not gain vocabulary terms.
 CONTAMINATION = ["Codex", "T3 Code", "Claude Code", "9Router", "TanStack", "Tailscale", "Coolify", "shadcn"]
-# (transport, model, reasoning_effort). "" omits the field, as the app does for "none".
-CLEANUP_CONFIGS = [
-    ("router", "claude-haiku-5-5", ""),  # baseline, thinking off
-    ("groq", "openai/gpt-oss-20b", "low"),
-    ("router", "groq/openai/gpt-oss-20b", "low"),
-    ("groq", "openai/gpt-oss-20b", "medium"),
-    ("groq", "openai/gpt-oss-120b", "low"),
-    ("router", "groq/openai/gpt-oss-120b", "low"),
-]
 GROQ_URL = "https://api.groq.com/openai/v1"
 # 9Router otherwise prepends its own style prompt to the system message.
 ROUTER_HEADERS = {"x-9router-token-saver": "off"}
 # 9Router adds a fixed buffer to reported prompt tokens; subtracted so paths compare.
 ROUTER_PROMPT_PAD = 2000
-# $ per 1M input/output tokens (Anthropic and Groq price pages, 2026-10).
-PRICES = {"claude-haiku-5-5": (0.10, 0.50), "gpt-oss-20b": (0.075, 0.30), "gpt-oss-120b": (0.15, 0.60)}
 
 def settings():
     return json.loads((pathlib.Path.home() / ".config/voice-prompt/settings.json").read_text())
@@ -251,7 +241,7 @@ def stt(args):
     # terminal, file in the title); prose clips stand for dictation elsewhere and get none.
     records = []
     for trial in range(args.trials):
-        for case in CORPUS["stt"]:
+        for case in [c for c in CORPUS["stt"] if audio_path(c).exists()]:
             audio = audio_path(case).read_bytes()
             for model in args.models:
                 for hint_name in args.hints:
@@ -299,6 +289,7 @@ def report_stt(records):
 
 # ---------- cleanup ----------
 
+@functools.cache
 def app_prompt():
     """CLEANUP_SYSTEM_PROMPT from providers.rs."""
     source = (ROOT / "src-tauri/src/providers.rs").read_text()
@@ -327,6 +318,11 @@ def distance(a, b):
     return row[len(b)]
 
 
+@functools.cache
+def relevant_terms(vocabulary, transcript):
+    return relevant(list(vocabulary), transcript)
+
+
 def relevant(vocabulary, transcript, limit=24):
     """Mirror of settings::relevant_terms."""
     words = [w for w in (squash(t) for t in transcript.split()) if w and w not in ("dot", "slash", "dash", "underscore")]
@@ -353,31 +349,6 @@ def relevant(vocabulary, transcript, limit=24):
     return out[:limit]
 
 
-def judge(case, output):
-    """Deterministic checks; returns a list of failures (empty = preserved)."""
-    if output is None:
-        return ["no output"]
-    # GPT-OSS writes "January\u202f15"; a narrow or non-breaking space is still a space.
-    output = re.sub(r"[\u00a0\u2007\u202f]", " ", output).replace("\u2019", "'")
-    lower = output.lower()
-    failures = []
-    for term in case.get("exact", []):
-        if not contains(output, term):
-            failures.append(f"missing exact {term!r}")
-    for options in case.get("all", []):
-        if not any(contains(output, o, case=False) for o in options):
-            failures.append(f"missing {options[0]!r}")
-    for banned in case.get("none", []):
-        if re.search(r"(?<![a-z0-9])" + re.escape(banned.strip().lower()) + r"(?![a-z0-9])", lower):
-            failures.append(f"kept {banned.strip()!r}")
-    ratio = len(output) / max(len(case["raw"]), 1)
-    if ratio > case.get("max_ratio", 1.6):
-        failures.append(f"grew x{ratio:.1f} (answered or expanded?)")
-    if ratio < case.get("min_ratio", 0.3):
-        failures.append(f"shrank x{ratio:.1f} (summarized?)")
-    return failures
-
-
 VOCABULARY_LABEL = "Spelling hints"
 # Candidate prompts, selected with --prompt; "app" is CLEANUP_SYSTEM_PROMPT. "label" names the
 # term list appended to the system message.
@@ -386,94 +357,144 @@ PROMPTS_FILE = HERE / "prompts.json"
 if PROMPTS_FILE.exists():
     PROMPTS.update(json.loads(PROMPTS_FILE.read_text()))
 
+# name: (base URL or None for the app's 9Router endpoint, keyring account, env override, headers).
+# A new OpenAI-compatible provider (Cerebras) is one line here plus a PROVIDERS entry.
+TRANSPORTS = {
+    "router": (None, "9router-api-key", "VP_KEY", ROUTER_HEADERS),
+    "groq": (GROQ_URL, "groq-api-key", "VP_GROQ_KEY", {}),
+}
+# --provider name: (transport, model, reasoning_effort). "" omits the field, as the app does for "none".
+PROVIDERS = {
+    "groq-20b": ("groq", "openai/gpt-oss-20b", "low"),
+    "router-20b": ("router", "groq/openai/gpt-oss-20b", "low"),
+    "router-haiku": ("router", "claude-haiku-5-5", ""),
+    "groq-120b": ("groq", "openai/gpt-oss-120b", "low"),
+}
+
 def transport(name):
-    if name == "groq":
-        return Client(GROQ_URL, credential("groq-api-key", "VP_GROQ_KEY"))
-    return Client(headers=ROUTER_HEADERS)
+    url, account, env, headers = TRANSPORTS[name]
+    return Client(url, credential(account, env), headers)
 
 def output_budget(raw):
     """Mirror of providers::output_budget."""
     return len(raw.encode()) // 2 + 512
 
+CASES = HERE / "cleanup.json"
+CACHE = HERE / ".cache" / "cleanup"
+SUITES = {"smoke": lambda c: c.get("smoke"), "dev": lambda c: c["suite"] == "dev",
+          "holdout": lambda c: c["suite"] == "holdout", "full": lambda c: True}
+
+
+def prompt_text(name):
+    variant = PROMPTS[name]
+    return variant.get("text") or app_prompt(), variant.get("label") or VOCABULARY_LABEL
+
+
+@functools.cache
+def prompt_hash(name):
+    text, label = prompt_text(name)
+    return hashlib.sha256(f"{text}\n{label}".encode()).hexdigest()[:10]
+
+
+def select(args):
+    corpus = json.loads(CASES.read_text())
+    cases = [c for c in corpus["cases"] if SUITES[args.suite](c)
+             and (not args.case or c["id"] in args.case)
+             and (not args.category or c["category"] in args.category)
+             and (not args.source or c["source"] in args.source)]
+    if not cases:
+        sys.exit("no cases match")
+    return corpus["vocabulary"], cases
+
+
+def request(case, vocabulary, prompt, model, effort):
+    """The app's request body (OpenAiCompatible::clean) for one case."""
+    text, label = prompt_text(prompt)
+    hints = case["hints"] if "hints" in case else relevant_terms(tuple(vocabulary), case["input"])
+    body = {"model": model, "stream": False, "max_tokens": output_budget(case["input"]), "messages": [
+        {"role": "system", "content": system_prompt(hints, "", text, label)},
+        {"role": "user", "content": f"<transcript>\n{case['input']}\n</transcript>"}]}
+    if effort:
+        body["reasoning_effort"] = effort
+    if "gpt-oss" in model:
+        body.update(include_reasoning=False, temperature=0)
+    return body
+
+
 def cleanup(args):
-    clients = {}
-    # --app-instructions appends the stored cleanup_instructions, as the app does.
-    extra = settings().get("cleanup_instructions", "") if args.app_instructions else ""
-    vocabulary = CORPUS["vocabulary"]["cleanup"]
-    variant = PROMPTS[args.prompt]
-    prompt_for = (lambda case: system_prompt(CORPUS["vocabulary"]["default"], extra, variant.get("text"), variant.get("label"))) \
-        if args.vocabulary == "global" \
-        else (lambda case: system_prompt(case["hints"] if "hints" in case else relevant(vocabulary, case["raw"]), extra,
-                                         variant.get("text"), variant.get("label")))
-    cases = [c for c in CORPUS["cleanup"] if not args.cases or c["id"] in args.cases]
-    records = []
-    for case in cases:  # raw/no-cleanup baseline: 0 ms, judged on the raw text
-        records.append({"config": "raw (no cleanup)", "trial": 0, "case": case["id"], "ms": 0,
-                        "output": case["raw"], "failures": judge(case, case["raw"])})
-    configs = [c for c in CLEANUP_CONFIGS if not args.only or f"{c[0]}:{c[1]}:{c[2] or 'omitted'}" in args.only]
-    for trial in range(args.trials):
-        for path, model, effort in configs:
+    """Stored transcript -> cleanup provider -> deterministic evaluator. No audio, no app.
+
+    Requests run concurrently (one keep-alive connection per worker thread). Outputs are cached
+    under bench/.cache keyed by the full request body, transport and trial, so a changed prompt,
+    model, effort or hint list never reuses an old output; --fresh bypasses the cache."""
+    vocabulary, cases = select(args)
+    for case in cases:  # outside the pool: pure-Python matching holds the GIL
+        relevant_terms(tuple(vocabulary), case["input"])
+    jobs = [(provider, prompt, case, trial) for provider in args.provider for prompt in args.prompt
+            for trial in range(args.trials) for case in cases]
+    local = threading.local()
+    stop = threading.Event()
+
+    def run(job):
+        provider, prompt, case, trial = job
+        path, model, effort = PROVIDERS[provider]
+        body = request(case, vocabulary, prompt, model, effort)
+        key = hashlib.sha256(json.dumps([TRANSPORTS[path][0], body, trial], sort_keys=True).encode()).hexdigest()
+        cached = CACHE / f"{key}.json"
+        record = {"provider": provider, "model": model, "effort": effort, "prompt": prompt,
+                  "prompt_hash": prompt_hash(prompt), "trial": trial, "case": case["id"], "suite": case["suite"],
+                  "category": case["category"], "source": case["source"]}
+        if stop.is_set():
+            return None
+        if cached.exists() and not args.fresh:
+            record.update(json.loads(cached.read_text()), cached=True)
+        else:
+            clients = local.__dict__.setdefault("clients", {})
             client = clients.get(path) or clients.setdefault(path, transport(path))
-            client.pace = args.pace
-            name = f"{path}:{model}:{effort or 'omitted'} prompt={args.prompt} vocab={args.vocabulary}"
-            if args.limit != "dynamic":
-                name += f" limit={args.limit}"
-            if args.temperature is not None and "gpt-oss" in model:
-                name += f" t={args.temperature:g}"
-            for case in cases:
-                body = {"model": model, "stream": False, "messages": [
-                    {"role": "system", "content": prompt_for(case)},
-                    {"role": "user", "content": f"<transcript>\n{case['raw']}\n</transcript>"}]}
-                if args.limit != "none":
-                    body["max_tokens"] = 4096 if args.limit == "fixed" else output_budget(case["raw"])
-                if effort:
-                    body["reasoning_effort"] = effort
-                if "gpt-oss" in model:
-                    body["include_reasoning"] = False
-                    if args.temperature is not None:
-                        body["temperature"] = args.temperature
-                if args.cold:
-                    client.reset()
-                receipt, parsed = client.post("/chat/completions", json.dumps(body).encode(), "application/json",
-                                              timeout=args.timeout, tries=args.tries)
-                choice = (parsed.get("choices") or [{}])[0]
-                output = (choice.get("message") or {}).get("content")
-                finish = choice.get("finish_reason")
-                failures = judge(case, output) if "error" not in receipt else [receipt["error"]]
-                if finish == "length":
-                    failures.append("finish_reason=length")
-                usage = parsed.get("usage") or {}
-                if path == "router" and usage.get("prompt_tokens"):
-                    usage["prompt_tokens"] -= ROUTER_PROMPT_PAD
-                record = {"config": name, "trial": trial, "case": case["id"], **receipt, "finish": finish,
-                          "output": output, "failures": failures, "usage": usage}
-                records.append(record)
-                print(json.dumps({k: v for k, v in record.items() if k != "usage"}), flush=True)
-        if args.idle and trial + 1 < args.trials:
-            time.sleep(args.idle)
-            # The app's pool drops connections idle past 90 s; the router's own upstream pool also idles.
-            for client in clients.values():
-                client.reset()
-    write("cleanup", records)
-    report_cleanup(records)
+            receipt, parsed = client.post("/chat/completions", json.dumps(body).encode(), "application/json",
+                                          timeout=args.timeout, tries=1)
+            choice = (parsed.get("choices") or [{}])[0]
+            result = {**receipt, "finish": choice.get("finish_reason"),
+                      "output": (choice.get("message") or {}).get("content"), "usage": parsed.get("usage") or {}}
+            if "error" not in receipt and result["finish"] != "length":
+                CACHE.mkdir(parents=True, exist_ok=True)
+                cached.write_text(json.dumps(result))
+            record.update(result, cached=False)
+        if "error" in record:
+            record["verdict"] = {"hard": [("provider", record["error"])], "soft": []}
+        elif record["finish"] == "length":
+            record["verdict"] = {"hard": [("provider", "finish_reason=length")], "soft": []}
+        else:
+            record["verdict"] = evaluate(case, record["output"])
+        if args.fail_fast and record["verdict"]["hard"]:
+            stop.set()
+        return record
+
+    started = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(args.concurrency) as pool:
+        records = [r for r in pool.map(run, jobs) if r]
+    elapsed = time.perf_counter() - started
+    if not args.quiet:
+        keep = ("provider", "model", "effort", "prompt", "prompt_hash", "trial", "case", "suite", "cached",
+                "wall_ms", "status", "error", "finish", "output", "verdict")
+        write("cleanup", [{k: r[k] for k in keep if k in r} for r in records])
+    report_cleanup(records, cases, args.verbose)
+    print(f"\n{len(records)} calls ({sum(r['cached'] for r in records)} cached) in {elapsed:.1f} s"
+          + (" — stopped at the first hard failure" if stop.is_set() else ""))
+    if any(r["verdict"]["hard"] for r in records):
+        sys.exit(1)
 
 def connection(args):
     """Cold, warm and idle-expired requests per path, on one short case. Round 0 opens a fresh
     connection (cold); later rounds follow `--idle` seconds of silence on a fresh connection, as
     the app's 90 s pool timeout would leave it (idle); the rest reuse the connection (warm)."""
-    variant = PROMPTS[args.prompt]
-    case = next(c for c in CORPUS["cleanup"] if c["id"] == "correction-deploy")
+    corpus = json.loads(CASES.read_text())
+    case = next(c for c in corpus["cases"] if c["id"] == "correction-deploy")
     body_for = {}
-    for path, model, effort in [c for c in CLEANUP_CONFIGS if f"{c[0]}:{c[1]}:{c[2] or 'omitted'}" in args.only]:
-        body = {"model": model, "stream": False, "max_tokens": output_budget(case["raw"]), "messages": [
-            {"role": "system", "content": system_prompt(relevant(CORPUS["vocabulary"]["cleanup"], case["raw"]), "",
-                                                        variant.get("text"), variant.get("label"))},
-            {"role": "user", "content": f"<transcript>\n{case['raw']}\n</transcript>"}]}
-        if effort:
-            body["reasoning_effort"] = effort
-        if "gpt-oss" in model:
-            body.update(include_reasoning=False, temperature=0)
-        body_for[f"{path}:{model}:{effort or 'omitted'}"] = (transport(path), json.dumps(body).encode())
+    for provider in args.provider:
+        path, model, effort = PROVIDERS[provider]
+        body = request(case, corpus["vocabulary"], args.prompt, model, effort)
+        body_for[provider] = (transport(path), json.dumps(body).encode())
     records = []
     for round_ in range(args.rounds):
         if round_:
@@ -496,46 +517,49 @@ def connection(args):
             print(f"{name:36} {phase:5} {lat['n']:>3} {lat['p50']:>5} {lat['p95']:>5} {max(r['ms'] for r in group):>5} "
                   f"{sum(1 for r in group if 'error' in r):>3}")
 
-def cost(model, usage):
-    price = next((p for key, p in PRICES.items() if key in model), None)
-    if not price or not usage:
-        return None
-    return (usage.get("prompt_tokens", 0) * price[0] + usage.get("completion_tokens", 0) * price[1]) / 1e6
+HARD = ["lost", "negation", "quantity", "question", "superseded", "answered", "invented", "literal", "empty", "provider"]
 
-KINDS = {"negation": ("negation",), "quantity": ("number", "quantity", "retries", "date"),
-         "contamination": ("prose", "answer"), "terms": ("spoken", "identifiers", "vocabulary", "muse", "commands",
-                                                         "code", "git", "literal")}
 
-def report_cleanup(records):
-    print(f"\n{'config':64} {'n':>3} {'p50':>5} {'p95':>5} {'ttfb50':>6} {'cold50':>6} {'warm50':>6} {'pass':>7} "
-          f"{'err':>3} {'429':>3} {'retry':>5} {'in':>5} {'out':>4} {'rsn':>4} {'$/1k':>6}")
-    for name in dict.fromkeys(r["config"] for r in records):
-        group = [r for r in records if r["config"] == name]
-        errors = sum(1 for r in group if "error" in r)
-        limited = sum(1 for r in group if r.get("status") == 429 or r.get("attempts", 1) > 1)
-        retries = sum(r.get("attempts", 1) - 1 for r in group)
-        # Successful requests only, so a fast error never looks like fast cleanup; wall time
-        # includes any 429 waits. Errors are counted in their own column.
-        ok = [r for r in group if "error" not in r]
-        lat = summary([r.get("wall_ms", r["ms"]) for r in ok])
-        ttfb = summary([r["ttfb_ms"] for r in ok if "ttfb_ms" in r])
-        cold = summary([r["ms"] for r in ok if r.get("cold")])
-        warm = summary([r["ms"] for r in ok if r.get("cold") is False])
-        passed = sum(1 for r in group if not r["failures"])
-        usage = [r.get("usage") or {} for r in group]
-        mean = lambda key: round(statistics.mean(u.get(key, 0) for u in usage)) if usage else 0
-        reasoning = round(statistics.mean((u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) for u in usage)) if usage else 0
-        costs = [c for c in (cost(name, u) for u in usage) if c is not None]
-        per_k = f"{statistics.mean(costs) * 1000:.3f}" if costs else "-"
-        print(f"{name:64} {lat['n']:>3} {lat['p50'] or 0:>5} {lat['p95'] or 0:>5} {ttfb['p50'] or 0:>6} {cold['p50'] or 0:>6} "
-              f"{warm['p50'] or 0:>6} {passed:>3}/{len(group):<3} {errors:>3} {limited:>3} {retries:>5} {mean('prompt_tokens'):>5} "
-              f"{mean('completion_tokens'):>4} {reasoning:>4} {per_k:>6}")
-        failed = [r for r in group if r["failures"]]
-        kinds = {k: sum(1 for r in failed if any(r["case"].startswith(p) for p in prefixes)) for k, prefixes in KINDS.items()}
-        if failed:
-            print("    by kind: " + ", ".join(f"{k}={v}" for k, v in kinds.items()))
-        for line in sorted({f"{r['case']}: {'; '.join(r['failures'])}" for r in failed}):
-            print("    " + line[:220])
+def report_cleanup(records, cases, verbose=False):
+    """Per provider x prompt: semantic pass (no hard failure) first, then clean (no soft
+    failure either), then latency over uncached calls only."""
+    by_id = {c["id"]: c for c in cases}
+    groups = {}
+    for r in records:
+        groups.setdefault((r["provider"], r["prompt"], r["prompt_hash"]), []).append(r)
+    print(f"\n{'provider':13} {'prompt':10} {'hash':10} {'suite':8} {'n':>3} {'semantic':>9} {'clean':>7} "
+          f"{'exact':>5} {'p50':>5} {'p95':>5} {'err':>3}  hard failures by type")
+    for (provider, prompt, hash_), group in groups.items():
+        for suite in ("dev", "holdout"):
+            rows = [r for r in group if r["suite"] == suite]
+            if not rows:
+                continue
+            hard = [r for r in rows if r["verdict"]["hard"]]
+            clean = [r for r in rows if not r["verdict"]["hard"] and not r["verdict"]["soft"]]
+            fresh = [r.get("wall_ms", r["ms"]) for r in rows if not r["cached"] and "error" not in r]
+            lat = summary(fresh)
+            types = {}
+            for r in hard:
+                for kind, _ in r["verdict"]["hard"]:
+                    types[kind] = types.get(kind, 0) + 1
+            print(f"{provider:13} {prompt:10} {hash_:10} {suite:8} {len(rows):>3} "
+                  f"{len(rows) - len(hard):>4}/{len(rows):<4} {len(clean):>3}/{len(rows):<3} "
+                  f"{sum(1 for r in rows if r['verdict'].get('exact')):>5} {lat['p50'] or '-':>5} {lat['p95'] or '-':>5} "
+                  f"{sum(1 for r in rows if 'error' in r):>3}  "
+                  + ", ".join(f"{k}={types[k]}" for k in HARD if k in types))
+        trials = {r["trial"] for r in group}
+        if len(trials) > 1:  # full: output stability across repetitions
+            unstable = [c for c in {r["case"] for r in group}
+                        if len({r.get("output") for r in group if r["case"] == c}) > 1]
+            print(f"    {len(trials)} trials; outputs differ across trials in {len(unstable)} cases"
+                  + (": " + ", ".join(sorted(unstable)[:12]) if unstable else ""))
+        for r in sorted(group, key=lambda r: (r["suite"], r["case"], r["trial"])):
+            failures = r["verdict"]["hard"] + (r["verdict"]["soft"] if verbose else [])
+            if failures:
+                mark = "HARD" if r["verdict"]["hard"] else "soft"
+                print(f"    {mark} {r['case']}: " + "; ".join(f"{k}: {d}" for k, d in failures)[:200])
+                print(f"         in:  {by_id[r['case']]['input'][:150]}")
+                print(f"         out: {(r.get('output') or '')[:150]}")
 
 # ---------- app log ----------
 
@@ -685,25 +709,25 @@ def main():
     p.add_argument("--cold", action="store_true", help="new connection per request")
     p.add_argument("--pace", type=float, default=3.5, help="seconds between requests (rate limit)")
     p.set_defaults(run=stt)
-    p = sub.add_parser("cleanup")
-    p.add_argument("--trials", type=int, default=2)
-    p.add_argument("--only", nargs="*", help="transport:model:effort entries to include")
-    p.add_argument("--cases", nargs="*", help="case ids to include")
-    p.add_argument("--prompt", choices=sorted(PROMPTS), default="app", help="system prompt variant (bench/prompts.json)")
-    p.add_argument("--limit", choices=["dynamic", "fixed", "none"], default="dynamic", help="max_tokens policy")
-    p.add_argument("--cold", action="store_true", help="new connection per request")
-    p.add_argument("--idle", type=float, default=0, help="seconds to sleep between trials (idle-expired pool)")
+    p = sub.add_parser("cleanup", help="stored transcripts -> cleanup provider -> evaluator")
+    p.add_argument("--suite", choices=sorted(SUITES), default="smoke",
+                   help="smoke: ~13 dev cases; dev: prompt-dev; holdout: never tune on it; full: both")
+    p.add_argument("--provider", nargs="+", choices=sorted(PROVIDERS), default=["groq-20b"])
+    p.add_argument("--prompt", nargs="+", choices=sorted(PROMPTS), default=["app"],
+                   help="system prompt variants (bench/prompts.json; app = CLEANUP_SYSTEM_PROMPT)")
+    p.add_argument("--case", nargs="*", help="case ids")
+    p.add_argument("--category", nargs="*", help="categories, e.g. semantic negation")
+    p.add_argument("--source", nargs="*", choices=["real", "real-tts", "constructed"])
+    p.add_argument("--trials", type=int, default=1, help="repetitions; use 3+ only for finalists (--suite full)")
+    p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--timeout", type=float, default=15, help="per-request timeout, as the app's cleanup_timeout_secs")
-    p.add_argument("--temperature", type=float, help="GPT-OSS sampling temperature (Haiku 5.5 rejects non-default values)")
-    p.add_argument("--tries", type=int, default=1, help="attempts on 429 (the app does not retry 429)")
-    p.add_argument("--pace", type=float, default=0.0, help="seconds between requests (rate limit)")
-    p.add_argument("--app-instructions", action="store_true", help="append the stored cleanup_instructions")
-    p.add_argument("--vocabulary", choices=["global", "relevant"], default="relevant",
-                   help="global: the default list for every case (old app); relevant: only mentioned terms (app now)")
+    p.add_argument("--fresh", action="store_true", help="ignore cached outputs (latency, nondeterminism)")
+    p.add_argument("--fail-fast", action="store_true", help="stop scheduling after the first hard failure")
+    p.add_argument("--verbose", "-v", action="store_true", help="also list soft failures")
+    p.add_argument("--quiet", "-q", action="store_true", help="do not write bench/results")
     p.set_defaults(run=cleanup)
     p = sub.add_parser("connection")
-    p.add_argument("--only", nargs="+", default=["router:claude-haiku-5-5:omitted", "groq:openai/gpt-oss-20b:low",
-                                                 "router:groq/openai/gpt-oss-20b:low"])
+    p.add_argument("--provider", nargs="+", choices=sorted(PROVIDERS), default=["router-haiku", "groq-20b", "router-20b"])
     p.add_argument("--prompt", choices=sorted(PROMPTS), default="app")
     p.add_argument("--rounds", type=int, default=6)
     p.add_argument("--warm", type=int, default=4, help="warm requests after each cold/idle one")
