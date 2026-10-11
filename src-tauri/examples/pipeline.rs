@@ -19,7 +19,8 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let connect = Box::new(move |settings: &settings::Settings| {
         let key = settings::secret::get()?.ok_or_else(|| anyhow::anyhow!("no API key"))?;
-        Ok(providers::connect(client.clone(), settings, key))
+        let groq = settings::secret::get_for(settings::secret::GROQ)?;
+        Ok(providers::connect(client.clone(), settings, key, groq))
     });
     let desktop = delivery::System {
         windows: None,

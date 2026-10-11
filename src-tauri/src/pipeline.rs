@@ -241,6 +241,7 @@ impl Pipeline {
 
         let mut cleanup_error = None;
         let mut cleaned = None;
+        let mut cleanup_model = None;
         if settings.cleanup_enabled {
             stage("cleaning");
             // Only terms the transcript appears to mention, so prose is not rewritten toward them.
@@ -261,7 +262,17 @@ impl Pipeline {
                     latency.cleanup_read_ms = result.timing.body_ms;
                     latency.cleanup_normalize_ms = result.timing.normalize_ms;
                     latency.cleanup_attempts = result.attempts;
-                    latency.outcome = "cleaned".into();
+                    latency.cleanup_provider = result.provider;
+                    latency.cleanup_model = result.model.clone();
+                    latency.cleanup_fallback_ms = result.failed_ms;
+                    latency.outcome = match result.fallback_reason {
+                        Some(reason) => {
+                            latency.cleanup_fallback_reason = reason;
+                            "cleaned_fallback".into()
+                        }
+                        None => "cleaned".into(),
+                    };
+                    cleanup_model = Some(result.model);
                     cleaned = Some(result.text);
                 }
                 Err(error) => {
@@ -293,9 +304,12 @@ impl Pipeline {
                 }
                 .into(),
                 stt_model,
-                cleanup_model: settings
-                    .cleanup_enabled
-                    .then(|| settings.cleanup_model.clone()),
+                // The model that wrote `cleaned`, or the one that was attempted.
+                cleanup_model: cleanup_model.or_else(|| {
+                    settings
+                        .cleanup_enabled
+                        .then(|| settings.cleanup_model.clone())
+                }),
                 error: cleanup_error.clone(),
                 duration_ms: audio_ms as i64,
                 latency_ms: released.elapsed().as_millis() as i64,
@@ -372,6 +386,13 @@ pub struct Latency {
     /// Wall time of the cleanup step, including retries and a failed attempt.
     cleanup_total_ms: u64,
     cleanup_attempts: u32,
+    /// `groq_direct` | `9router`, and the model that wrote the delivered text.
+    cleanup_provider: &'static str,
+    cleanup_model: String,
+    /// The preferred cleaner's failure when the fallback model cleaned; empty otherwise.
+    cleanup_fallback_reason: &'static str,
+    /// Time lost to that failed attempt, part of `cleanup_total_ms`.
+    cleanup_fallback_ms: u64,
     history_ms: u64,
     held_wait_ms: u64,
     insert_setup_ms: u64,
@@ -383,7 +404,8 @@ pub struct Latency {
     /// Time since the previous provider request; above the 90 s pool timeout the
     /// connection is cold.
     idle_ms: u64,
-    /// cleaned | raw (cleanup off) | fallback_<failure> | stt_<failure> | empty
+    /// cleaned | cleaned_fallback (by the fallback model) | raw (cleanup off) |
+    /// fallback_<failure> (raw delivered) | stt_<failure> | empty
     outcome: String,
     /// typed | pasted | pasted_terminal | copied_<reason> | failed
     delivery: String,
@@ -445,7 +467,8 @@ impl Latency {
         log::info!(
             "latency total={} audio={} chars={} idle={} capture={} first_audio={} finish={} keyring={} wav={} \
              stt_setup={} stt_wait={} stt_read={} stt_norm={} cleanup_setup={} cleanup_wait={} cleanup_read={} \
-             cleanup_norm={} cleanup_total={} cleanup_attempts={} history={} held_wait={} insert_setup={} \
+             cleanup_norm={} cleanup_total={} cleanup_attempts={} cleanup_provider={} cleanup_model={} \
+             cleanup_fallback_reason={} cleanup_fallback={} history={} held_wait={} insert_setup={} \
              insert_keys={} clipboard={} untimed={} outcome={} delivery={} destination={} \
              stt_mode={} fallback_reason={} release_to_stt={} release_to_cleaned={} token={} \
              connected={} ready={} first_sent={} first_partial={} first_final={} released={} last_sent={} \
@@ -469,6 +492,10 @@ impl Latency {
             self.cleanup_normalize_ms,
             self.cleanup_total_ms,
             self.cleanup_attempts,
+            or_na(self.cleanup_provider),
+            or_na(&self.cleanup_model),
+            or_na(self.cleanup_fallback_reason),
+            self.cleanup_fallback_ms,
             self.history_ms,
             self.held_wait_ms,
             self.insert_setup_ms,
@@ -534,6 +561,24 @@ mod tests {
 
     struct Cleaner(Result<&'static str, &'static str>);
 
+    /// Cleans through the fallback model after the preferred one was rate limited.
+    struct FallbackCleaner;
+
+    #[async_trait]
+    impl PromptCleaner for FallbackCleaner {
+        async fn clean(&self, _: &str, _: &[String], _: &str) -> Result<Cleaned> {
+            Ok(Cleaned {
+                text: "Fallback.".into(),
+                timing: Default::default(),
+                attempts: 1,
+                provider: "9router",
+                model: "claude-haiku-5-5".into(),
+                fallback_reason: Some("rate_limited"),
+                failed_ms: 40,
+            })
+        }
+    }
+
     #[async_trait]
     impl PromptCleaner for Cleaner {
         async fn clean(&self, _: &str, _: &[String], _: &str) -> Result<Cleaned> {
@@ -542,6 +587,10 @@ mod tests {
                     text: text.into(),
                     timing: Default::default(),
                     attempts: 1,
+                    provider: "9router",
+                    model: "fake-model".into(),
+                    fallback_reason: None,
+                    failed_ms: 0,
                 })
                 .map_err(|message| anyhow!(message))
         }
@@ -729,6 +778,31 @@ mod tests {
         assert_eq!(entry.cleaned, None);
         assert_eq!(entry.error.as_deref(), Some("cleanup timed out"));
         assert_eq!(latency(&rig).outcome, "fallback_error");
+    }
+
+    #[tokio::test]
+    async fn fallback_cleanup_is_attributed_to_the_fallback_model() {
+        let (snapshot, desktop) = same_window();
+        let dir = tempfile::tempdir().unwrap();
+        let history = HistoryStore::open(&dir.path().join("history.db")).unwrap();
+        let stt = Stt::default();
+        *stt.answers.lock().unwrap() = vec![Ok("raw words".into())];
+        let connect: Connect = Box::new(move |_| {
+            Ok(Providers {
+                stt: Box::new(stt.clone()),
+                cleaner: Box::new(FallbackCleaner),
+            })
+        });
+        let pipeline = Pipeline::new(history, connect, Arc::new(desktop));
+        pipeline.run(&snapshot, recording(None), |_| {}).await.unwrap();
+        let latency = pipeline.last_latency.lock().unwrap().clone().unwrap();
+        // Not counted as a preferred-model success.
+        assert_eq!(latency.outcome, "cleaned_fallback");
+        assert_eq!(latency.cleanup_fallback_reason, "rate_limited");
+        assert_eq!(latency.cleanup_model, "claude-haiku-5-5");
+        let entry = &pipeline.history.lock().unwrap().list(1).unwrap()[0];
+        assert_eq!(entry.cleanup_model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(entry.cleaned.as_deref(), Some("Fallback."));
     }
 
     #[tokio::test]

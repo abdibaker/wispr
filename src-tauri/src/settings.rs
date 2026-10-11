@@ -28,8 +28,11 @@ pub struct Settings {
     pub streaming_provider: StreamingProvider,
     // Cleanup
     pub cleanup_enabled: bool,
+    pub cleanup_provider: CleanupProvider,
     pub cleanup_model: String,
     pub reasoning_effort: String,
+    /// Tried through 9Router when the cleanup model fails; empty: none.
+    pub cleanup_fallback_model: String,
     pub cleanup_instructions: String,
     // Vocabulary
     pub vocabulary: Vec<String>,
@@ -54,6 +57,15 @@ pub enum StreamingProvider {
     Deepgram,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CleanupProvider {
+    /// api.groq.com with its own key.
+    Groq,
+    #[serde(other)]
+    Router,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -73,10 +85,11 @@ impl Default for Settings {
             // Beat Deepgram on latency, WER and term accuracy (bench/results/e2e-muse-*).
             streaming_provider: StreamingProvider::Muse,
             cleanup_enabled: true,
-            // Fastest model passing the full cleanup corpus (bench/results, 2026-10-09).
-            cleanup_model: "claude-haiku-5-5".into(),
-            // Omits the field: Haiku answers without thinking.
-            reasoning_effort: "none".into(),
+            cleanup_provider: CleanupProvider::Router,
+            // Passes the cleanup corpus at a quarter of Haiku's latency (bench/results, 2026-10-10).
+            cleanup_model: "groq/openai/gpt-oss-20b".into(),
+            reasoning_effort: "low".into(),
+            cleanup_fallback_model: "claude-haiku-5-5".into(),
             cleanup_instructions: String::new(),
             vocabulary: [
                 "9Router",
@@ -193,6 +206,8 @@ pub mod secret {
     pub const ROUTER: &str = "9router-api-key";
     /// Meta Model API key for the default Muse provider; Muse has no token broker.
     pub const MUSE: &str = "meta-muse-api-key";
+    /// Groq key for direct cleanup, bypassing 9Router.
+    pub const GROQ: &str = "groq-api-key";
 
     fn entry(account: &str) -> Result<keyring::Entry> {
         Ok(keyring::Entry::new(SERVICE, account)?)
@@ -312,6 +327,11 @@ fn mentions(words: &[String], term: &str) -> bool {
     })
 }
 
+/// Spoken digits, so "nine router" can select 9Router.
+const DIGITS: [&str; 10] = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+];
+
 /// Vocabulary terms the transcript appears to mention, in list order, at most `CLEANUP_TERMS`.
 pub fn relevant_terms<'a>(vocabulary: &'a [String], transcript: &str) -> Vec<&'a str> {
     // Spoken separators ("cargo dot toml") carry no letters of the written term.
@@ -320,9 +340,16 @@ pub fn relevant_terms<'a>(vocabulary: &'a [String], transcript: &str) -> Vec<&'a
         .map(squash)
         .filter(|w| !w.is_empty() && !["dot", "slash", "dash", "underscore"].contains(&w.as_str()))
         .collect();
+    let digits: Vec<String> = words
+        .iter()
+        .map(|w| match DIGITS.iter().position(|d| d == w) {
+            Some(digit) => digit.to_string(),
+            None => w.clone(),
+        })
+        .collect();
     vocabulary_terms(vocabulary)
         .into_iter()
-        .filter(|term| mentions(&words, term))
+        .filter(|term| mentions(&words, term) || mentions(&digits, term))
         .take(CLEANUP_TERMS)
         .collect()
 }
@@ -458,6 +485,11 @@ mod tests {
             ["TanStack", "Cargo.toml", "@tanstack/react-query", "reqwest"]
         );
         assert!(relevant_terms(&vocabulary, "Don't log the request body.").is_empty());
+        // Muse spells digits out and joins file names.
+        assert_eq!(
+            relevant_terms(&vocabulary, "Bump Cargotoml and route it through nine router."),
+            ["9Router", "Cargo.toml"]
+        );
     }
 
     #[test]
@@ -481,6 +513,7 @@ mod tests {
             "That Jane was yielding to the preference which she had begun to entertain for him from the first.",
             "Let's go to the Chinese restaurant tonight, but please do not bring Sam, you know, he is very annoying.",
             "Can you send me the report by Friday? The code of conduct says we close at five.",
+            "We're driving nine hours tomorrow, so let's leave at three and stop for lunch.",
         ] {
             assert!(relevant_terms(&vocabulary, prose).is_empty(), "{prose}");
         }

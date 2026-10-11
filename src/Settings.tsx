@@ -17,8 +17,10 @@ type SettingsData = {
   streaming_model: string;
   streaming_provider: "deepgram" | "muse";
   cleanup_enabled: boolean;
+  cleanup_provider: "router" | "groq";
   cleanup_model: string;
   reasoning_effort: string;
+  cleanup_fallback_model: string;
   cleanup_instructions: string;
   vocabulary: string[];
   history_enabled: boolean;
@@ -328,22 +330,91 @@ function Speech({ settings, update }: SectionProps) {
 }
 
 function Cleanup({ settings, update }: SectionProps) {
+  const [hasGroqKey, setHasGroqKey] = useState(false);
+  const [groqKey, setGroqKey] = useState("");
+  const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null);
+  const [testing, setTesting] = useState(false);
+
+  useEffect(() => {
+    invoke<boolean>("has_groq_key").then(setHasGroqKey).catch(() => setHasGroqKey(false));
+  }, []);
+
+  const saveGroqKey = async () => {
+    try {
+      await invoke("set_groq_key", { key: groqKey });
+      setGroqKey("");
+      setHasGroqKey(groqKey.trim().length > 0);
+      setTest({ ok: true, text: groqKey.trim() ? "Groq key saved to the system keyring." : "Groq key removed." });
+    } catch (error) {
+      setTest({ ok: false, text: String(error) });
+    }
+  };
+
+  const testGroq = async () => {
+    setTesting(true);
+    try {
+      setTest({ ok: true, text: await invoke<string>("test_groq") });
+    } catch (error) {
+      setTest({ ok: false, text: String(error) });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  // 9Router names Groq models "groq/<id>"; Groq itself uses the bare id.
+  const setProvider = (cleanup_provider: SettingsData["cleanup_provider"]) => {
+    const model = settings.cleanup_model;
+    const cleanup_model =
+      cleanup_provider === "groq" ? model.replace(/^groq\//, "") : model.includes("/") && !model.startsWith("groq/") ? `groq/${model}` : model;
+    update({ cleanup_provider, cleanup_model });
+  };
+
   return (
     <section>
       <h1>Prompt cleanup</h1>
       <Row label="Clean up prompts" hint="Off: insert the raw transcript.">
         <Toggle checked={settings.cleanup_enabled} onChange={(cleanup_enabled) => update({ cleanup_enabled })} />
       </Row>
-      <Row label="Model" hint="Uses the same 9Router endpoint and key.">
+      <Row label="Provider" hint="Groq direct needs a Groq key; without one, cleanup goes through 9Router.">
+        <select value={settings.cleanup_provider} onChange={(e) => setProvider(e.target.value as SettingsData["cleanup_provider"])}>
+          <option value="router">9Router</option>
+          <option value="groq">Groq direct</option>
+        </select>
+      </Row>
+      <Row label="Model" hint={settings.cleanup_provider === "groq" ? "Groq model id, e.g. openai/gpt-oss-20b." : "9Router model, e.g. groq/openai/gpt-oss-20b."}>
         <Text value={settings.cleanup_model} onSave={(cleanup_model) => update({ cleanup_model })} spellCheck={false} />
       </Row>
-      <Row label="Reasoning effort">
+      <Row label="Reasoning effort" hint="GPT-OSS takes low, medium or high; none omits the field.">
         <select value={settings.reasoning_effort} onChange={(e) => update({ reasoning_effort: e.target.value })}>
           {["none", "low", "medium", "high"].map((effort) => (
             <option key={effort}>{effort}</option>
           ))}
         </select>
       </Row>
+      <Row label="Fallback model" hint="Tried once through 9Router if the model above fails. Empty: insert the raw transcript.">
+        <Text value={settings.cleanup_fallback_model} onSave={(cleanup_fallback_model) => update({ cleanup_fallback_model })} spellCheck={false} />
+      </Row>
+      <Row label="Groq API key" hint={hasGroqKey ? "Stored in the system keyring. Enter a new one to replace it." : "Not set. Only needed for Groq direct."}>
+        <span className="inline">
+          <input
+            type="password"
+            autoComplete="off"
+            placeholder={hasGroqKey ? "••••••••" : "gsk_…"}
+            value={groqKey}
+            onChange={(e) => setGroqKey(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && saveGroqKey()}
+          />
+          <button onClick={saveGroqKey} disabled={!groqKey && !hasGroqKey}>
+            {groqKey || !hasGroqKey ? "Save" : "Remove"}
+          </button>
+        </span>
+      </Row>
+      <div className="actions">
+        <button onClick={testGroq} disabled={testing || !hasGroqKey}>
+          {testing ? "Testing…" : "Test Groq"}
+        </button>
+        {test ? <span className={test.ok ? "ok" : "error"}>{test.text}</span> : null}
+      </div>
       <Row
         label="Extra instructions"
         hint="Optional. Cleanup is always conservative: it removes fillers and false starts, applies self-corrections, fixes grammar, and never adds requirements."

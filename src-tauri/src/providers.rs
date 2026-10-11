@@ -1,5 +1,5 @@
-//! SpeechProvider and PromptCleaner over OpenAI-compatible HTTP (9Router).
-use crate::settings::Settings;
+//! SpeechProvider and PromptCleaner over OpenAI-compatible HTTP (9Router, or Groq for cleanup).
+use crate::settings::{CleanupProvider, Settings};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -29,6 +29,13 @@ pub struct Cleaned {
     pub timing: HttpTiming,
     /// Requests sent, including the retry of a dropped connection.
     pub attempts: u32,
+    /// `groq_direct` | `9router`, and the model that produced `text`.
+    pub provider: &'static str,
+    pub model: String,
+    /// Why the preferred cleaner failed when `text` came from the fallback.
+    pub fallback_reason: Option<&'static str>,
+    /// Time spent on the failed preferred attempt, included in the caller's total.
+    pub failed_ms: u64,
 }
 
 /// Why a provider call failed, so logs never count a fallback as a fast success.
@@ -105,27 +112,63 @@ pub struct Providers {
     pub cleaner: Box<dyn PromptCleaner>,
 }
 
-/// The app's providers: both go through the 9Router endpoint with one key.
-pub fn connect(client: reqwest::Client, settings: &Settings, api_key: String) -> Providers {
-    let stt = OpenAiCompatible {
-        client,
+pub const GROQ_URL: &str = "https://api.groq.com/openai/v1";
+
+/// The app's providers: STT through 9Router; cleanup through 9Router, or Groq directly with
+/// `groq_key`, falling back to `cleanup_fallback_model` through 9Router.
+pub fn connect(
+    client: reqwest::Client,
+    settings: &Settings,
+    api_key: String,
+    groq_key: Option<String>,
+) -> Providers {
+    let router = |model: &str, timeout_secs: u64, reasoning_effort: &str| OpenAiCompatible {
+        client: client.clone(),
         base_url: settings.endpoint.clone(),
-        api_key,
-        model: settings.stt_model.clone(),
-        timeout: Duration::from_secs(settings.stt_timeout_secs),
-        reasoning_effort: String::new(),
+        api_key: api_key.clone(),
+        model: model.into(),
+        timeout: Duration::from_secs(timeout_secs),
+        reasoning_effort: reasoning_effort.into(),
+        provider: "9router",
     };
-    let cleaner = OpenAiCompatible {
-        model: settings.cleanup_model.clone(),
-        timeout: Duration::from_secs(settings.cleanup_timeout_secs),
-        reasoning_effort: settings.reasoning_effort.clone(),
-        client: stt.client.clone(),
-        base_url: stt.base_url.clone(),
-        api_key: stt.api_key.clone(),
+    let stt = router(&settings.stt_model, settings.stt_timeout_secs, "");
+    let preferred = match (settings.cleanup_provider, groq_key) {
+        (CleanupProvider::Groq, Some(key)) => OpenAiCompatible {
+            base_url: GROQ_URL.into(),
+            api_key: key,
+            provider: "groq_direct",
+            ..router(
+                &settings.cleanup_model,
+                settings.cleanup_timeout_secs,
+                &settings.reasoning_effort,
+            )
+        },
+        // No Groq key: the same model through 9Router, which names it `groq/<id>`.
+        (CleanupProvider::Groq, None) if !settings.cleanup_model.starts_with("groq/") => router(
+            &format!("groq/{}", settings.cleanup_model),
+            settings.cleanup_timeout_secs,
+            &settings.reasoning_effort,
+        ),
+        _ => router(
+            &settings.cleanup_model,
+            settings.cleanup_timeout_secs,
+            &settings.reasoning_effort,
+        ),
+    };
+    let fallback = settings.cleanup_fallback_model.trim();
+    let same = preferred.provider == "9router" && fallback == preferred.model;
+    let cleaner: Box<dyn PromptCleaner> = if fallback.is_empty() || same {
+        Box::new(preferred)
+    } else {
+        Box::new(Fallback {
+            preferred,
+            // Effort is tuned for the preferred model; the fallback runs without it.
+            fallback: router(fallback, settings.cleanup_timeout_secs, ""),
+        })
     };
     Providers {
         stt: Box::new(stt),
-        cleaner: Box::new(cleaner),
+        cleaner,
     }
 }
 
@@ -136,20 +179,64 @@ pub struct OpenAiCompatible {
     pub model: String,
     pub timeout: Duration,
     pub reasoning_effort: String,
+    /// `9router` | `groq_direct`, for logs.
+    pub provider: &'static str,
 }
 
-/// Turns HTTP failures into actionable messages without echoing request contents.
-async fn check(response: reqwest::Response) -> Result<reqwest::Response> {
+/// Groq's GPT-OSS models by either name (`openai/gpt-oss-20b`, `groq/openai/gpt-oss-20b`).
+fn is_gpt_oss(model: &str) -> bool {
+    model.contains("gpt-oss")
+}
+
+/// Completion budget: cleaned text is about as long as the transcript (roughly 4 characters
+/// per token), plus GPT-OSS reasoning, which at low effort reached 256 tokens on short input
+/// in 2 of 2,200 corpus calls. A larger cap measured no slower; it only bounds a runaway.
+pub fn output_budget(raw: &str) -> u32 {
+    (raw.len() / 2 + 512) as u32
+}
+
+/// The preferred cleaner, then one immediate attempt on the fallback model. No waiting or
+/// retry chain: a 429 or timeout costs the user the failed attempt plus one fallback call.
+pub struct Fallback {
+    pub preferred: OpenAiCompatible,
+    pub fallback: OpenAiCompatible,
+}
+
+#[async_trait]
+impl PromptCleaner for Fallback {
+    async fn clean(&self, raw: &str, vocabulary: &[String], extra: &str) -> Result<Cleaned> {
+        let started = Instant::now();
+        let error = match self.preferred.clean(raw, vocabulary, extra).await {
+            Ok(cleaned) => return Ok(cleaned),
+            Err(error) => error,
+        };
+        let reason = Failure::of(&error).map_or("error", Failure::name);
+        log::warn!(
+            "cleanup_provider={} cleanup_model={} failed ({reason}): {error:#}",
+            self.preferred.provider,
+            self.preferred.model
+        );
+        let failed_ms = ms(started);
+        let mut cleaned = self.fallback.clean(raw, vocabulary, extra).await?;
+        cleaned.fallback_reason = Some(reason);
+        cleaned.failed_ms = failed_ms;
+        cleaned.attempts += 1;
+        Ok(cleaned)
+    }
+}
+
+/// Turns HTTP failures into actionable messages without echoing request contents or `key`.
+async fn check(response: reqwest::Response, key: &str) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
     let body = response.text().await.unwrap_or_default();
-    let detail: String = body.chars().take(300).collect();
+    let detail: String = body.replace(key, "[redacted]").chars().take(300).collect();
     Err(match status.as_u16() {
         401 | 403 => fail(
             Failure::Http,
-            format!("9Router rejected the API key ({status}). Update it in Settings → Speech."),
+            format!("The provider rejected the API key ({status}). Update it in Settings."),
         ),
         404 => fail(
             Failure::Http,
@@ -218,7 +305,7 @@ impl SpeechProvider for OpenAiCompatible {
             ..Default::default()
         };
         let sent = Instant::now();
-        let response = check(request.send().await.map_err(network_error)?).await?;
+        let response = check(request.send().await.map_err(network_error)?, &self.api_key).await?;
         timing.wait_ms = ms(sent);
         let received = Instant::now();
         let bytes = response.bytes().await.map_err(network_error)?;
@@ -258,7 +345,7 @@ impl PromptCleaner for OpenAiCompatible {
         let mut system = CLEANUP_SYSTEM_PROMPT.to_string();
         let terms = crate::settings::vocabulary_terms(vocabulary);
         if !terms.is_empty() {
-            system.push_str("\nVocabulary: ");
+            system.push_str("\nSpelling hints: ");
             system.push_str(&terms.join(", "));
         }
         if !extra.trim().is_empty() {
@@ -269,6 +356,7 @@ impl PromptCleaner for OpenAiCompatible {
         let mut body = serde_json::json!({
             "model": self.model,
             "stream": false,
+            "max_tokens": output_budget(raw),
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": format!("<transcript>\n{raw}\n</transcript>")},
@@ -277,7 +365,14 @@ impl PromptCleaner for OpenAiCompatible {
         if !self.reasoning_effort.is_empty() && self.reasoning_effort != "none" {
             body["reasoning_effort"] = self.reasoning_effort.clone().into();
         }
+        if is_gpt_oss(&self.model) {
+            // Reasoning stays server-side; temperature 0 removed the corpus's flaky cases.
+            body["include_reasoning"] = false.into();
+            body["temperature"] = 0.into();
+        }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        // 9Router otherwise prepends its own style prompt to the system message.
+        let token_saver = (self.provider == "9router").then_some(("x-9router-token-saver", "off"));
         let mut timing = HttpTiming {
             setup_ms: ms(started),
             ..Default::default()
@@ -286,9 +381,11 @@ impl PromptCleaner for OpenAiCompatible {
         let response = loop {
             attempts += 1;
             let sent = Instant::now();
-            let result = self
-                .client
-                .post(&url)
+            let mut request = self.client.post(&url);
+            if let Some((name, value)) = token_saver {
+                request = request.header(name, value);
+            }
+            let result = request
                 .bearer_auth(&self.api_key)
                 .timeout(self.timeout.saturating_sub(started.elapsed()))
                 .json(&body)
@@ -301,7 +398,7 @@ impl PromptCleaner for OpenAiCompatible {
                 Err(error) if attempts == 1 && !error.is_timeout() && error.is_request() => {
                     log::debug!("cleanup request failed, retrying once: {error}");
                 }
-                result => break check(result.map_err(network_error)?).await?,
+                result => break check(result.map_err(network_error)?, &self.api_key).await?,
             }
         };
         let received = Instant::now();
@@ -320,6 +417,10 @@ impl PromptCleaner for OpenAiCompatible {
             text,
             timing,
             attempts,
+            provider: self.provider,
+            model: self.model.clone(),
+            fallback_reason: None,
+            failed_ms: 0,
         })
     }
 }
@@ -454,6 +555,201 @@ mod tests {
             cleaned_text(&json, "x").unwrap(),
             "    preserve_indentation()\n\tnext()"
         );
+    }
+
+    /// A one-route HTTP server answering each request with the next scripted response and
+    /// recording the request bodies. `None` never answers (a hung provider).
+    async fn server(
+        responses: Vec<Option<(u16, serde_json::Value)>>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 8192];
+                let body = loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.to_lowercase().strip_prefix("content-length: ").map(String::from))
+                        .and_then(|l| l.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break body.to_string();
+                    }
+                };
+                seen.lock().unwrap().push(serde_json::from_str(&body).unwrap());
+                let Some((status, json)) = response else {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    continue;
+                };
+                let json = json.to_string();
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (url, bodies)
+    }
+
+    fn cleaner(url: &str, model: &str, provider: &'static str) -> OpenAiCompatible {
+        OpenAiCompatible {
+            client: reqwest::Client::new(),
+            base_url: url.into(),
+            api_key: "test".into(),
+            model: model.into(),
+            timeout: Duration::from_millis(500),
+            reasoning_effort: if is_gpt_oss(model) { "low" } else { "none" }.into(),
+            provider,
+        }
+    }
+
+    fn fallback(preferred: &str, router: &str) -> Fallback {
+        Fallback {
+            preferred: cleaner(preferred, "openai/gpt-oss-20b", "groq_direct"),
+            fallback: cleaner(router, "claude-haiku-5-5", "9router"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gpt_oss_requests_are_bounded_and_hide_reasoning() {
+        let (url, bodies) = server(vec![Some((200, completion("Deploy on Monday.", "stop")))]).await;
+        let raw = "Deploy tomorrow, no, change that to Monday.";
+        let cleaned = cleaner(&url, "openai/gpt-oss-20b", "groq_direct")
+            .clean(raw, &["9Router".into()], "")
+            .await
+            .unwrap();
+        assert_eq!(cleaned.text, "Deploy on Monday.");
+        assert_eq!((cleaned.provider, cleaned.fallback_reason), ("groq_direct", None));
+        let body = &bodies.lock().unwrap()[0];
+        assert_eq!(body["model"], "openai/gpt-oss-20b");
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["include_reasoning"], false);
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["max_tokens"], output_budget(raw));
+        assert!(body["messages"][0]["content"].as_str().unwrap().ends_with("Spelling hints: 9Router"));
+    }
+
+    #[tokio::test]
+    async fn haiku_requests_carry_no_gpt_oss_fields() {
+        let (url, bodies) = server(vec![Some((200, completion("Fix it.", "stop")))]).await;
+        cleaner(&url, "claude-haiku-5-5", "9router").clean("fix it", &[], "").await.unwrap();
+        let body = &bodies.lock().unwrap()[0];
+        for field in ["reasoning_effort", "include_reasoning", "temperature"] {
+            assert!(body.get(field).is_none(), "{field}");
+        }
+    }
+
+    #[test]
+    fn output_budget_scales_with_the_transcript() {
+        assert_eq!(output_budget("short"), 514);
+        let long = "word ".repeat(2000);
+        // Well above the ~2500 tokens the 10,000-character transcript needs.
+        assert!(output_budget(&long) > 5000);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_falls_back_at_once() {
+        let (groq, _) = server(vec![Some((429, serde_json::json!({"error": "rate"})))]).await;
+        let (router, bodies) = server(vec![Some((200, completion("Fixed.", "stop")))]).await;
+        let started = Instant::now();
+        let cleaned = fallback(&groq, &router).clean("fix", &[], "").await.unwrap();
+        // No retry-after wait or backoff before the fallback (Groq advertises seconds).
+        assert!(started.elapsed() < Duration::from_secs(2), "no retry wait");
+        assert_eq!(cleaned.text, "Fixed.");
+        assert_eq!(cleaned.model, "claude-haiku-5-5");
+        assert_eq!(cleaned.provider, "9router");
+        assert_eq!(cleaned.fallback_reason, Some("rate_limited"));
+        assert_eq!(cleaned.attempts, 2);
+        assert_eq!(bodies.lock().unwrap()[0]["model"], "claude-haiku-5-5");
+    }
+
+    #[tokio::test]
+    async fn timeouts_and_bad_answers_fall_back() {
+        for (response, reason) in [
+            (None, "timeout"),
+            (Some((200, completion(" ", "stop"))), "empty"),
+            (Some((200, completion("Only half", "length"))), "truncated"),
+            (Some((200, serde_json::json!({"choices": []}))), "malformed"),
+            (Some((503, serde_json::json!({"error": "down"}))), "http"),
+        ] {
+            let (groq, _) = server(vec![response]).await;
+            let (router, _) = server(vec![Some((200, completion("Fixed.", "stop")))]).await;
+            let cleaned = fallback(&groq, &router).clean("fix", &[], "").await.unwrap();
+            assert_eq!(cleaned.fallback_reason, Some(reason));
+            assert_eq!(cleaned.text, "Fixed.");
+            assert!(cleaned.failed_ms > 0 || reason != "timeout");
+        }
+    }
+
+    #[tokio::test]
+    async fn error_bodies_never_echo_the_key() {
+        let echoed = serde_json::json!({"error": "invalid key secret-abc"});
+        let (url, _) = server(vec![Some((500, echoed))]).await;
+        let mut cleaner = cleaner(&url, "claude-haiku-5-5", "9router");
+        cleaner.api_key = "secret-abc".into();
+        let message = format!("{:#}", cleaner.clean("x", &[], "").await.err().unwrap());
+        assert!(message.contains("invalid key [redacted]"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn both_cleaners_failing_is_an_error() {
+        let (groq, _) = server(vec![Some((429, serde_json::json!({})))]).await;
+        let (router, _) = server(vec![Some((429, serde_json::json!({})))]).await;
+        let result = fallback(&groq, &router).clean("fix", &[], "").await;
+        assert_eq!(Failure::of(&result.err().unwrap()), Some(Failure::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn a_network_failure_falls_back() {
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = format!("http://{}", unused.local_addr().unwrap());
+        drop(unused);
+        let (router, _) = server(vec![Some((200, completion("Fixed.", "stop")))]).await;
+        let cleaned = fallback(&closed, &router).clean("fix", &[], "").await.unwrap();
+        assert_eq!(cleaned.fallback_reason, Some("network"));
+    }
+
+    #[tokio::test]
+    async fn groq_cleanup_needs_the_setting_and_a_key() {
+        let (router_url, router) = server(vec![Some((200, completion("Routed.", "stop")))]).await;
+        let settings = Settings {
+            endpoint: router_url,
+            cleanup_fallback_model: String::new(),
+            ..Default::default()
+        };
+        // The default routes through 9Router even when a Groq key exists.
+        let routed = connect(reqwest::Client::new(), &settings, "k".into(), Some("g".into()));
+        let cleaned = routed.cleaner.clean("x", &[], "").await.unwrap();
+        assert_eq!((cleaned.provider, cleaned.text.as_str()), ("9router", "Routed."));
+        assert_eq!(router.lock().unwrap()[0]["model"], "groq/openai/gpt-oss-20b");
+        // Groq selected but no key saved: still 9Router, so dictation keeps working.
+        let (router_url, router) = server(vec![Some((200, completion("Routed.", "stop")))]).await;
+        let keyless = Settings {
+            cleanup_provider: CleanupProvider::Groq,
+            endpoint: router_url,
+            ..settings
+        };
+        let keyless = Settings {
+            cleanup_model: "openai/gpt-oss-20b".into(),
+            ..keyless
+        };
+        let routed = connect(reqwest::Client::new(), &keyless, "k".into(), None);
+        assert_eq!(routed.cleaner.clean("x", &[], "").await.unwrap().provider, "9router");
+        assert_eq!(router.lock().unwrap()[0]["model"], "groq/openai/gpt-oss-20b");
     }
 
     #[test]

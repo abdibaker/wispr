@@ -279,7 +279,12 @@ fn connect(client: reqwest::Client) -> voice_prompt::pipeline::Connect {
     Box::new(move |settings| {
         let key = settings::secret::get()?
             .ok_or_else(|| anyhow!("No 9Router API key. Open Voice Prompt settings → Speech."))?;
-        Ok(providers::connect(client.clone(), settings, key))
+        // Without a Groq key, Groq cleanup runs through 9Router instead.
+        let groq = match settings.cleanup_provider {
+            settings::CleanupProvider::Groq => settings::secret::get_for(settings::secret::GROQ)?,
+            settings::CleanupProvider::Router => None,
+        };
+        Ok(providers::connect(client.clone(), settings, key, groq))
     })
 }
 
@@ -338,6 +343,47 @@ fn has_muse_key() -> CommandResult<bool> {
 #[tauri::command]
 fn set_muse_key(key: String) -> CommandResult<()> {
     settings::secret::set_for(settings::secret::MUSE, key.trim()).map_err(text_error)
+}
+
+#[tauri::command]
+fn has_groq_key() -> CommandResult<bool> {
+    settings::secret::get_for(settings::secret::GROQ)
+        .map(|k| k.is_some())
+        .map_err(text_error)
+}
+
+#[tauri::command]
+fn set_groq_key(key: String) -> CommandResult<()> {
+    settings::secret::set_for(settings::secret::GROQ, key.trim()).map_err(text_error)
+}
+
+/// Checks the stored Groq key and that it can use the cleanup model.
+#[tauri::command]
+async fn test_groq(state: tauri::State<'_, AppState>) -> CommandResult<String> {
+    let model = state.settings.lock().unwrap().cleanup_model.clone();
+    // The 9Router alias `groq/openai/gpt-oss-20b` is `openai/gpt-oss-20b` at Groq.
+    let model = model.strip_prefix("groq/").unwrap_or(&model).to_string();
+    let key = settings::secret::get_for(settings::secret::GROQ)
+        .map_err(text_error)?
+        .ok_or("No Groq key saved")?;
+    let started = Instant::now();
+    let response = state
+        .client
+        .get(format!("{}/models/{model}", providers::GROQ_URL))
+        .bearer_auth(key)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Cannot reach Groq: {e}"))?;
+    match response.status().as_u16() {
+        200 => Ok(format!(
+            "Groq accepted the key for {model} ({} ms).",
+            started.elapsed().as_millis()
+        )),
+        401 | 403 => Err("Groq rejected the key".into()),
+        404 => Err(format!("Groq has no model '{model}'")),
+        status => Err(format!("Groq returned {status}")),
+    }
 }
 
 /// Handshakes with Muse using the stored key, without sending audio.
@@ -690,6 +736,9 @@ fn main() {
             has_muse_key,
             set_muse_key,
             test_muse,
+            has_groq_key,
+            set_groq_key,
+            test_groq,
             list_microphones,
             test_connection,
             history_list,
