@@ -47,7 +47,7 @@ Each case in `cleanup.json`:
 
 Spans are compared on normalized text: case, punctuation, `don't`/`do not`, `three`/`3`, `ms`/`milliseconds`, `10–15`/`10 to 15`. Two more hard checks run on every case: recall of the closest expected output below 75% (`lost`: the summarization detector) and more than max(3, 20%) output words that appear in neither the input nor any expected output (`invented`: answers, explanations, leaked reasoning). A provider error or truncation is hard `provider`.
 
-`source`: `real` is the author's own dictation (`history.db`, or E2E runs of the author's recordings), `real-tts` is a Muse transcript of a TTS clip (a real STT error on synthetic audio), `constructed` is hand-written. `tuned: true` marks cases the old prompts (v3 to v17) were iterated on.
+`source`: `real` is the author's own dictation (`history.db`, or E2E runs of the author's recordings), `real-tts` is a Muse transcript of a TTS clip (a real STT error on synthetic audio), `constructed` is hand-written. `tuned: true` marks cases the old prompts (v3 to v17) were iterated on. `real-flow` cases live in the gitignored `cleanup.local.json` (Muse transcripts of the author's private Wispr Flow dictations, exported to the gitignored `audio/flow/`); `select` merges them when the file exists.
 
 Self-check: `python3 bench/evaluate.py`.
 
@@ -62,7 +62,7 @@ python3 bench/run.py record                                    # record the auth
 
 `examples/stt.rs` streams each WAV at real time through the app's own `streaming::start`, so the provider code, handshake and finalization are the app's. Rows are split by speech kind (`author`, `librivox`, `neural`, `espeak`) and never mixed. Columns: WER, written-form terms, numbers, omitted reference words, `partial50` (first audio sent to first non-empty partial), `final50`/`final95` (last audio chunk to the provider's confirmed final transcript), failures by reason (connect, finalize timeout, disconnect). No cleanup runs.
 
-The core corpus is `core: true` clips: the author's voice, 2 to 20 s, with exact references. Two exist; `run.py record` prompts for the other 14 (16 kHz mono via `parecord`). Edit a reference if you said it differently. Synthetic clips stay a separate stress suite.
+The core corpus is `core: true` clips: the author's voice, 2 to 20 s, with exact references. `run.py record` prompts for missing ones (16 kHz mono via `parecord`, stopped with SIGINT after a short grace so the buffered tail is written) and warns when a clip ends mid-speech. Edit a reference if you said it differently. Synthetic clips stay a separate stress suite.
 
 `python3 bench/run.py stt` is the older batch Whisper comparison through 9Router.
 

@@ -498,6 +498,7 @@ def output_budget(raw):
     return len(raw.encode()) // 2 + 512
 
 CASES = HERE / "cleanup.json"
+LOCAL_CASES = HERE / "cleanup.local.json"  # private dictations, gitignored
 CACHE = HERE / ".cache" / "cleanup"
 SUITES = {"smoke": lambda c: c.get("smoke"), "dev": lambda c: c["suite"] == "dev",
           "holdout": lambda c: c["suite"] == "holdout", "full": lambda c: True}
@@ -516,6 +517,8 @@ def prompt_hash(name):
 
 def select(args):
     corpus = json.loads(CASES.read_text())
+    if LOCAL_CASES.exists():
+        corpus["cases"] += json.loads(LOCAL_CASES.read_text())["cases"]
     cases = [c for c in corpus["cases"] if SUITES[args.suite](c)
              and (not args.case or c["id"] in args.case)
              and (not args.category or c["category"] in args.category)
@@ -848,7 +851,7 @@ def main():
                    help="system prompt variants (bench/prompts.json; app = CLEANUP_SYSTEM_PROMPT)")
     p.add_argument("--case", nargs="*", help="case ids")
     p.add_argument("--category", nargs="*", help="categories, e.g. semantic negation")
-    p.add_argument("--source", nargs="*", choices=["real", "real-tts", "constructed"])
+    p.add_argument("--source", nargs="*", choices=["real", "real-tts", "constructed", "real-flow"])
     p.add_argument("--trials", type=int, default=1, help="repetitions; use 3+ only for finalists (--suite full)")
     p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--timeout", type=float, default=15, help="per-request timeout, as the app's cleanup_timeout_secs")
