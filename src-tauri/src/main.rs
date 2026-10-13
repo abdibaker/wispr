@@ -251,6 +251,11 @@ async fn process(app: &AppHandle, snapshot: &Snapshot, recording: Recording) {
             overlay(app, "error", "Nothing recognised");
             return hide_overlay_later(app, 1500);
         }
+        // The text appearing is confirmation enough; only fallbacks like "Copied" need words.
+        Ok(Outcome::Delivered {
+            message: "Inserted",
+            cleanup_failed: false,
+        }) => overlay(app, "hidden", ""),
         Ok(Outcome::Delivered {
             message,
             cleanup_failed: false,
