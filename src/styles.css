@@ -307,14 +307,24 @@ html.overlay-root body {
   width: 232px;
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 10px;
   padding: 0 16px;
   border-radius: 22px;
-  background: rgba(24, 24, 30, 0.92);
+  background: #0b0b0d;
+  border: 1.5px solid rgba(255, 255, 255, 0.28);
   color: #fff;
   font-size: 13px;
   font-weight: 500;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.45);
+  transition: width 180ms ease;
+}
+
+.pill-compact {
+  width: 120px;
+  height: 36px;
+  margin-top: 8px;
+  padding: 0 14px;
 }
 
 .dot {
@@ -323,16 +333,6 @@ html.overlay-root body {
   border-radius: 50%;
   flex: none;
   background: #8b81ff;
-}
-
-.pill-recording .dot {
-  background: #ff4d5e;
-  animation: pulse 1s ease-in-out infinite;
-}
-
-.pill-transcribing .dot,
-.pill-cleaning .dot {
-  animation: pulse 0.8s ease-in-out infinite;
 }
 
 .pill-done .dot {
@@ -350,16 +350,49 @@ html.overlay-root body {
 .meter {
   display: flex;
   gap: 3px;
-  height: 20px;
+  height: 18px;
   align-items: center;
 }
 
 .meter span {
   width: 3px;
-  height: 20px;
+  height: 18px;
   border-radius: 2px;
   background: #fff;
-  transition: transform 60ms linear;
+  transition: transform 80ms linear;
+}
+
+.dots {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+
+.dots span {
+  width: 2.5px;
+  height: 2.5px;
+  border-radius: 50%;
+  background: #fff;
+  animation: trail 0.9s ease-in-out infinite;
+}
+
+.spinner {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  animation: spin 0.8s steps(8) infinite;
+}
+
+.spinner span {
+  position: absolute;
+  left: 7px;
+  top: 0;
+  width: 2px;
+  height: 5px;
+  border-radius: 1px;
+  background: #fff;
+  transform-origin: 1px 8px;
 }
 
 .pill-text {
@@ -368,15 +401,23 @@ html.overlay-root body {
   white-space: nowrap;
 }
 
-@keyframes pulse {
+@keyframes trail {
   50% {
-    opacity: 0.35;
+    opacity: 0.3;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .dot,
-  .meter span {
+  .pill,
+  .meter span,
+  .dots span,
+  .spinner {
     animation: none !important;
     transition: none;
   }
