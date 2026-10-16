@@ -181,7 +181,6 @@ fn keysym(c: char) -> String {
 }
 
 const SHIFT: u32 = 1;
-const CTRL: u32 = 4;
 /// Evdev keycodes we remap: only the main block's character keys. Chromium and Electron
 /// derive the DOM `code` from the keycode, so remapping Esc (1), Backspace (14) or Tab (15)
 /// made VS Code and Chrome drop or delete characters. XKB keycode = evdev + 8.
@@ -194,6 +193,12 @@ const CODES: [u32; 49] = [
 ];
 
 const KEY_V: u32 = 47;
+const PASTE_KEYMAP: &str = "xkb_keymap {
+    xkb_keycodes { include \"evdev+aliases(qwerty)\" };
+    xkb_types { include \"complete\" };
+    xkb_compatibility { include \"complete\" };
+    xkb_symbols { include \"pc+us\" };
+};";
 
 /// Splits text into runs with at most `CODES.len()` distinct characters each; every run is
 /// typed with its own keymap.
@@ -271,8 +276,7 @@ impl VirtualKeyboard {
         self.start.elapsed().as_millis() as u32
     }
 
-    fn set_keymap(&mut self, chars: &[char]) -> Result<()> {
-        let text = keymap(chars);
+    fn set_keymap(&mut self, text: &str) -> Result<()> {
         let fd = memfd::MemfdOptions::default().create("voice-prompt-keymap")?;
         let mut file = fd.as_file();
         file.write_all(text.as_bytes())?;
@@ -319,7 +323,7 @@ impl VirtualKeyboard {
                 unique.push(*c);
             }
         }
-        self.set_keymap(&unique)?;
+        self.set_keymap(&keymap(&unique))?;
         self.modifiers(0);
         for c in batch {
             let code = CODES[unique.iter().position(|u| u == c).unwrap()];
@@ -335,18 +339,20 @@ impl VirtualKeyboard {
     }
 
     pub fn paste(mut self, shift: bool) -> Result<()> {
-        // Electron resolves Ctrl+<key> shortcuts from the physical key, so "v" must sit on
-        // the V keycode (evdev 47) for VS Code to see Ctrl+V.
-        let v = CODES.iter().position(|&c| c == KEY_V).unwrap();
-        let mut keys = vec!['\0'; v + 1];
-        keys[v] = 'v';
-        self.set_keymap(&keys)?;
-        self.modifiers(if shift { CTRL | SHIFT } else { CTRL });
-        self.tap(KEY_V)?;
-        self.modifiers(0);
+        self.set_keymap(PASTE_KEYMAP)?;
+        self.keyboard.key(self.time(), 29, 1);
+        if shift {
+            self.keyboard.key(self.time(), 42, 1);
+        }
+        let tapped = self.tap(KEY_V);
+        if shift {
+            self.keyboard.key(self.time(), 42, 0);
+        }
+        self.keyboard.key(self.time(), 29, 0);
         self.queue.roundtrip(&mut State)?;
         self.keyboard.destroy();
         self.connection.flush()?;
+        tapped?;
         Ok(())
     }
 }
@@ -363,14 +369,6 @@ mod tests {
         assert!(map.contains("key <K11> { [ U00E9 ] };"));
         assert!(map.contains("key <K12> { [ Return ] };"));
         assert!(map.contains("maximum = 12;"));
-    }
-
-    #[test]
-    fn paste_uses_the_v_key() {
-        let v = CODES.iter().position(|&c| c == KEY_V).unwrap();
-        let mut keys = vec!['\0'; v + 1];
-        keys[v] = 'v';
-        assert!(keymap(&keys).contains("key <K55> { [ U0076 ] };"));
     }
 
     #[test]

@@ -22,6 +22,18 @@ async fn main() -> anyhow::Result<()> {
         keys_held: Box::new(|| false),
     };
     let pressed = desktop.windows.as_ref().and_then(target::Tracker::active);
+    if let Some(expected) = args
+        .iter()
+        .position(|argument| argument == "--expect-app")
+        .and_then(|position| args.get(position + 1))
+    {
+        anyhow::ensure!(
+            pressed
+                .as_ref()
+                .is_some_and(|window| window.app_id == *expected),
+            "Expected focused app {expected}, found {pressed:?}"
+        );
+    }
     if let Some(wait) = args
         .iter()
         .position(|a| a == "--revalidate")
