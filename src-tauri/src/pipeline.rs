@@ -1,5 +1,5 @@
 //! The voice pipeline: one recording → Muse (streamed, else batch Whisper over the retained
-//! PCM) → Haiku cleanup → history → delivery. A successful transcript is never dropped: it is kept as the last prompt and
+//! PCM) → Qwen cleanup → history → delivery. A successful transcript is never dropped: it is kept as the last prompt and
 //! saved before delivery, and audio whose STT failed is kept for a retry.
 use crate::delivery::{self, Desktop};
 use crate::history::{now_ms, Entry, HistoryStore};
@@ -640,7 +640,7 @@ mod tests {
         let entry = &history(&rig)[0];
         assert_eq!(entry.raw, "streamed text");
         assert_eq!(entry.stt_model, "meta/muse-voice-transcribe-1.0");
-        assert_eq!(entry.cleanup_model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(entry.cleanup_model.as_deref(), Some("qwen-3.8-27b"));
         assert_eq!(latency(&rig).stt_mode, "streaming_muse");
         assert_eq!(typed(&rig), ["Cleaned."]);
     }

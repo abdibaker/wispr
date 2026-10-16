@@ -285,11 +285,23 @@ function Speech({ settings, update }: SectionProps) {
 
 function Cleanup({ settings, update }: SectionProps) {
   const [hasKey, setHasKey] = useState(false);
+  const [hasCerebrasKey, setHasCerebrasKey] = useState(false);
   const [test, testing, run, setTest] = useTest();
 
   useEffect(() => {
     invoke<boolean>("has_api_key").then(setHasKey).catch(() => setHasKey(false));
+    invoke<boolean>("has_cerebras_key").then(setHasCerebrasKey).catch(() => setHasCerebrasKey(false));
   }, []);
+
+  const saveCerebrasKey = async (key: string) => {
+    try {
+      await invoke("set_cerebras_key", { key });
+      setHasCerebrasKey(key.trim().length > 0);
+      setTest({ ok: true, text: key.trim() ? "Cerebras key saved to the system keyring." : "Cerebras key removed." });
+    } catch (error) {
+      setTest({ ok: false, text: String(error) });
+    }
+  };
 
   const saveKey = async (key: string) => {
     try {
@@ -305,17 +317,23 @@ function Cleanup({ settings, update }: SectionProps) {
     <section>
       <h1>Prompt cleanup</h1>
       <p className="lead">
-        Claude Haiku 5.5 makes the fewest edits that turn speech into written text: it removes fillers and false starts,
+        Qwen 3.8 27B on Cerebras makes the fewest edits that turn speech into written text: it removes fillers and false starts,
         applies spoken corrections, and fixes punctuation, numbers and technical spellings. It never summarizes or
         rewrites.
       </p>
       <Row label="Clean up prompts" hint="Off: insert the raw transcript.">
         <Toggle checked={settings.cleanup_enabled} onChange={(cleanup_enabled) => update({ cleanup_enabled })} />
       </Row>
-      <Row label="9Router endpoint" hint="OpenAI-compatible base URL, also used for the batch fallback.">
+      <KeyRow label="Cerebras API key" missing="Not set. Needed for cleanup." placeholder="csk-…" has={hasCerebrasKey} save={saveCerebrasKey} />
+      <div className="actions">
+        <button onClick={() => run("test_cerebras")} disabled={testing || !hasCerebrasKey}>
+          {testing ? "Testing…" : "Test Cerebras"}
+        </button>
+      </div>
+      <Row label="9Router endpoint" hint="OpenAI-compatible base URL for the Whisper batch fallback.">
         <Text value={settings.endpoint} onSave={(endpoint) => update({ endpoint })} spellCheck={false} />
       </Row>
-      <KeyRow label="9Router API key" missing="Not set. Needed for cleanup and the batch fallback." placeholder="sk-…" has={hasKey} save={saveKey} />
+      <KeyRow label="9Router API key" missing="Not set. Needed for the batch fallback." placeholder="sk-…" has={hasKey} save={saveKey} />
       <div className="actions">
         <button onClick={() => run("test_connection")} disabled={testing || !hasKey}>
           {testing ? "Testing…" : "Test connection"}

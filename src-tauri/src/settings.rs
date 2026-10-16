@@ -19,7 +19,7 @@ pub struct Settings {
     pub sounds: bool,
     // Speech
     pub microphone: String,
-    /// 9Router base URL, for cleanup and the batch fallback.
+    /// 9Router base URL, for the batch fallback.
     pub endpoint: String,
     pub language: String,
     /// Stream audio live to Muse while the key is held; batch Whisper stays the fallback.
@@ -165,8 +165,10 @@ pub fn apply_autostart(enabled: bool) -> Result<()> {
 pub mod secret {
     use anyhow::Result;
     const SERVICE: &str = "voice-prompt";
-    /// The 9Router key: Haiku cleanup and the batch Whisper fallback.
+    /// The 9Router key for the batch Whisper fallback.
     pub const ROUTER: &str = "9router-api-key";
+    /// Cerebras key for Qwen cleanup.
+    pub const CEREBRAS: &str = "cerebras-api-key";
     /// Meta Model API key for live Muse transcription; Muse has no token broker.
     pub const MUSE: &str = "meta-muse-api-key";
 

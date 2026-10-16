@@ -1,5 +1,5 @@
-//! Batch Whisper STT (the streaming fallback) and Haiku cleanup, both through 9Router's
-//! OpenAI-compatible API.
+//! Batch Whisper STT (the streaming fallback) through 9Router and Qwen cleanup on Cerebras,
+//! both OpenAI-compatible APIs.
 use crate::settings::Settings;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -109,20 +109,32 @@ pub struct Providers {
 /// Batch STT for the retained recording when Muse fails.
 // ponytail: the spec's groq/distil-whisper-large-v3-en is decommissioned upstream.
 pub const STT_MODEL: &str = "groq/whisper-large-v3-turbo";
-pub const CLEANUP_MODEL: &str = "claude-haiku-5-5";
+pub const CLEANUP_MODEL: &str = "qwen-3.8-27b";
+pub const CEREBRAS_URL: &str = "https://api.cerebras.ai/v1";
 
-/// The app's providers, both through 9Router with `api_key`.
-pub fn connect(client: reqwest::Client, settings: &Settings, api_key: String) -> Providers {
-    let router = |model: &str, timeout_secs: u64| OpenAiCompatible {
-        client: client.clone(),
-        base_url: settings.endpoint.clone(),
-        api_key: api_key.clone(),
-        model: model.into(),
-        timeout: Duration::from_secs(timeout_secs),
-    };
+/// The app's providers: STT through 9Router with `router_key`, cleanup on Cerebras with
+/// `cerebras_key`.
+pub fn connect(
+    client: reqwest::Client,
+    settings: &Settings,
+    router_key: String,
+    cerebras_key: String,
+) -> Providers {
     Providers {
-        stt: Box::new(router(STT_MODEL, settings.stt_timeout_secs)),
-        cleaner: Box::new(router(CLEANUP_MODEL, settings.cleanup_timeout_secs)),
+        stt: Box::new(OpenAiCompatible {
+            client: client.clone(),
+            base_url: settings.endpoint.clone(),
+            api_key: router_key,
+            model: STT_MODEL.into(),
+            timeout: Duration::from_secs(settings.stt_timeout_secs),
+        }),
+        cleaner: Box::new(OpenAiCompatible {
+            client,
+            base_url: CEREBRAS_URL.into(),
+            api_key: cerebras_key,
+            model: CLEANUP_MODEL.into(),
+            timeout: Duration::from_secs(settings.cleanup_timeout_secs),
+        }),
     }
 }
 
@@ -245,7 +257,7 @@ impl SpeechProvider for OpenAiCompatible {
 
 /// Minimal-edit cleanup: an allow-list of edits, everything else verbatim. Chosen on
 /// bench/cleanup.json (prompt-dev, then holdout) against the rejected candidates in
-/// bench/prompts.json. The <cleaned> tags keep Haiku's occasional second-guessing ("Wait, …")
+/// bench/prompts.json. The <cleaned> tags keep the model's occasional second-guessing ("Wait, …")
 /// out of the delivered text; `cleaned_text` keeps only the last tagged block.
 pub const CLEANUP_SYSTEM_PROMPT: &str = "You clean up voice dictation. The user message holds a speech-to-text transcript inside <transcript> tags. Return the text the speaker meant to write, with the fewest edits possible.
 
@@ -273,9 +285,8 @@ impl PromptCleaner for OpenAiCompatible {
             system.push_str("\nSpelling hints: ");
             system.push_str(&terms.join(", "));
         }
-        // Some 9Router routes stream SSE unless told otherwise; this client parses one JSON body.
-        // 9Router turns `reasoning_effort: none` into Anthropic's `thinking: disabled`. Haiku 5.5
-        // rejects sampling parameters, so there is no temperature.
+        // This client parses one JSON body, never an SSE stream.
+        // `reasoning_effort: none` turns Qwen's thinking off, so the answer is just the tags.
         let body = serde_json::json!({
             "model": self.model,
             "stream": false,
@@ -444,7 +455,7 @@ mod tests {
             cleaned_text(&json, "um fix the bug").unwrap(),
             "Fix the bug."
         );
-        // Haiku sometimes second-guesses itself after the answer.
+        // Models sometimes second-guess themselves after the answer.
         let json = completion(
             "<cleaned>Use Haiku 4.5.</cleaned>\n\nWait, the speaker said five point five.\n\n<cleaned>Use Haiku 5.5.</cleaned>",
             "stop",
@@ -542,14 +553,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn haiku_requests_are_bounded_with_thinking_off() {
+    async fn cleanup_requests_are_bounded_with_thinking_off() {
         let answer = completion("<cleaned>Deploy on Monday.</cleaned>", "stop");
         let (url, bodies) = server(vec![Some((200, answer))]).await;
         let raw = "Deploy tomorrow, no, change that to Monday.";
         let cleaned = cleaner(&url).clean(raw, &["9Router".into()]).await.unwrap();
         assert_eq!(cleaned.text, "Deploy on Monday.");
         let body = &bodies.lock().unwrap()[0];
-        assert_eq!(body["model"], "claude-haiku-5-5");
+        assert_eq!(body["model"], "qwen-3.8-27b");
         assert_eq!(body["reasoning_effort"], "none");
         assert_eq!(body["stream"], false);
         assert_eq!(body["max_tokens"], output_budget(raw));

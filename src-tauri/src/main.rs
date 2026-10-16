@@ -282,8 +282,16 @@ async fn process(app: &AppHandle, snapshot: &Snapshot, recording: Recording) {
 fn connect(client: reqwest::Client) -> voice_prompt::pipeline::Connect {
     Box::new(move |settings| {
         let key = settings::secret::get()?
-            .ok_or_else(|| anyhow!("No 9Router API key. Open Voice Prompt settings → Speech."))?;
-        Ok(providers::connect(client.clone(), settings, key))
+            .ok_or_else(|| anyhow!("No 9Router API key. Open Voice Prompt settings → Cleanup."))?;
+        // Unused with cleanup off, so only required when cleanup runs.
+        let cerebras = match settings::secret::get_for(settings::secret::CEREBRAS)? {
+            Some(key) => key,
+            None if settings.cleanup_enabled => {
+                anyhow::bail!("No Cerebras API key. Open Voice Prompt settings → Cleanup.")
+            }
+            None => String::new(),
+        };
+        Ok(providers::connect(client.clone(), settings, key, cerebras))
     })
 }
 
@@ -344,6 +352,53 @@ fn set_muse_key(key: String) -> CommandResult<()> {
     settings::secret::set_for(settings::secret::MUSE, key.trim()).map_err(text_error)
 }
 
+#[tauri::command]
+fn has_cerebras_key() -> CommandResult<bool> {
+    settings::secret::get_for(settings::secret::CEREBRAS)
+        .map(|k| k.is_some())
+        .map_err(text_error)
+}
+
+#[tauri::command]
+fn set_cerebras_key(key: String) -> CommandResult<()> {
+    settings::secret::set_for(settings::secret::CEREBRAS, key.trim()).map_err(text_error)
+}
+
+/// Checks the Cerebras key and that the cleanup model is listed.
+#[tauri::command]
+async fn test_cerebras(state: tauri::State<'_, AppState>) -> CommandResult<String> {
+    let key = settings::secret::get_for(settings::secret::CEREBRAS)
+        .map_err(text_error)?
+        .ok_or("No Cerebras API key saved")?;
+    let started = Instant::now();
+    let response = state
+        .client
+        .get(format!("{}/models", providers::CEREBRAS_URL))
+        .bearer_auth(key)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Cannot reach Cerebras: {e}"))?;
+    let status = response.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err("Cerebras rejected the API key".into());
+    }
+    if !status.is_success() {
+        return Err(format!("Cerebras returned {status}"));
+    }
+    let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    let listed = json["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|m| m["id"] == providers::CLEANUP_MODEL);
+    let mut message = format!("Connected in {} ms.", started.elapsed().as_millis());
+    if !listed {
+        message += &format!(" Model '{}' is not listed.", providers::CLEANUP_MODEL);
+    }
+    Ok(message)
+}
+
 /// Handshakes with Muse using the stored key, without sending audio.
 #[tauri::command]
 async fn test_muse() -> CommandResult<String> {
@@ -397,10 +452,9 @@ async fn test_connection(state: tauri::State<'_, AppState>) -> CommandResult<Str
         .filter_map(|m| m["id"].as_str())
         .collect();
     let mut message = format!("Connected in {} ms.", started.elapsed().as_millis());
-    for model in [providers::STT_MODEL, providers::CLEANUP_MODEL] {
-        if !ids.is_empty() && !ids.contains(&model) {
-            message += &format!(" Model '{model}' is not listed by the endpoint.");
-        }
+    let model = providers::STT_MODEL;
+    if !ids.is_empty() && !ids.contains(&model) {
+        message += &format!(" Model '{model}' is not listed by the endpoint.");
     }
     Ok(message)
 }
@@ -693,6 +747,9 @@ fn main() {
             set_api_key,
             has_muse_key,
             set_muse_key,
+            has_cerebras_key,
+            set_cerebras_key,
+            test_cerebras,
             test_muse,
             list_microphones,
             test_connection,
