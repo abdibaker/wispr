@@ -196,7 +196,23 @@ fn event_nodes() -> Vec<PathBuf> {
             p.file_name()
                 .is_some_and(|n| n.to_string_lossy().starts_with("event"))
         })
+        .filter(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            std::fs::read_to_string(format!("/sys/class/input/{name}/device/capabilities/key"))
+                .map_or(true, |keys| has_keyboard_keys(&keys))
+        })
         .collect()
+}
+
+fn has_keyboard_keys(capabilities: &str) -> bool {
+    capabilities
+        .split_whitespace()
+        .next_back()
+        .and_then(|word| u64::from_str_radix(word, 16).ok())
+        .is_none_or(|keys| {
+            let required = (1u64 << KeyCode::KEY_LEFTCTRL.0) | (1u64 << KeyCode::KEY_A.0);
+            keys & required == required
+        })
 }
 
 /// Only real keyboards are watched, so mice and touchpads get no reader thread
@@ -270,6 +286,19 @@ mod tests {
     use super::*;
     use HotkeyEvent::*;
     use KeyCode as K;
+
+    #[test]
+    fn filters_keyboard_capabilities() {
+        assert!(has_keyboard_keys("60000000"));
+        assert!(has_keyboard_keys("ffffffffffffffff"));
+        assert!(has_keyboard_keys("0 0 60000000\n"));
+        assert!(!has_keyboard_keys("60000000 0"));
+        assert!(!has_keyboard_keys("0"));
+        assert!(!has_keyboard_keys("20000000"));
+        assert!(!has_keyboard_keys("40000000"));
+        assert!(has_keyboard_keys(""));
+        assert!(has_keyboard_keys("not-hex"));
+    }
 
     #[test]
     fn parses_shortcuts() {
