@@ -66,17 +66,47 @@ The package installs a udev rule granting the active session read access to `/de
 
 Open _Voice Prompt_ from the launcher. Enter the Meta Muse key under **Speech** (**Test Muse**) and the 9Router key under **Cleanup** (**Test connection**).
 
-## Development checks
+## Verification
+
+Run the completion gate from the repository root:
 
 ```sh
-cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
-pnpm check
-python3 bench/run.py cleanup                     # cleanup smoke suite, ~2 s
-cargo run --example pipeline -- sample.wav       # batch Whisper + cleanup with your keys
-cargo run --example ptt -- 4000                  # hold Ctrl+Super for 4 s via uinput
+pnpm verify
 ```
 
-See `bench/README.md` for the cleanup regression suites, the Muse clip check and end-to-end runs.
+The gate runs its own failure-propagation self-check, Rust formatting, all-target
+Clippy with warnings denied, Rust library/binary/doc tests, the Python evaluator
+self-check, and the frontend typecheck and production build. It stops at the first
+failure and prints per-stage and total elapsed time.
+
+Prerequisites: the Linux development packages listed above, Bash, Python 3.9+,
+Rust with `rustfmt` and Clippy, and installed frontend dependencies. Cargo runs
+with `--locked --offline` and reuses its normal build cache. On a fresh checkout,
+prepare dependencies with `pnpm install --frozen-lockfile` and
+`cargo fetch --locked --manifest-path src-tauri/Cargo.toml` before verification.
+
+The gate does not fetch dependencies, call live providers, access API credentials,
+capture audio or send desktop input. It uses local loopback servers in tests.
+It builds `dist/`, but skips release compilation, packaging and live benchmarks.
+
+### Fast iteration
+
+Run only the affected check while editing, then `pnpm verify` before handoff.
+All commands below run from the repository root:
+
+| Changed area | Focused check |
+| --- | --- |
+| Rust subsystem | `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib streaming::tests` (replace `streaming` with the affected module) |
+| App orchestration | `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --bin voice-prompt` |
+| TypeScript | `pnpm check` |
+| Cleanup evaluator | `python3 bench/evaluate.py` |
+| Verification script | `python3 scripts/test_verify.py` |
+
+UI changes also need a real-browser or app check. Microphone capture, Wayland
+delivery and live provider quality/latency need separate opt-in checks; passing
+the local gate does not prove them. See `bench/README.md` before running those
+checks. Its cleanup runner still targets historical Haiku through 9Router, not
+the production Qwen/Cerebras path.
 
 ## Uninstall
 

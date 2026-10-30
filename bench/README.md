@@ -1,16 +1,35 @@
 # Regression checks
 
-Stdlib Python; uses the app's endpoint (`~/.config/voice-prompt/settings.json`) and keyring keys. Results land in the gitignored `results/`.
+Use `pnpm verify` from the repository root for the local completion gate. It
+includes `python3 bench/evaluate.py`, which checks the evaluator without provider
+calls. The commands here are opt-in checks, not part of that gate.
+
+Live runners use credentials and may incur charges. Desktop checks need an
+available Wayland session and can inject keyboard input; run them only when the
+desktop is dedicated to the check. Do not run them during normal typing.
+
+Stdlib Python; the historical cleanup runner uses the configured 9Router endpoint
+(`~/.config/voice-prompt/settings.json`) and keyring key. Muse uses its own key.
+Results land in the gitignored `results/`.
 
 | Check | Input | Command | Time |
 |---|---|---|---|
-| Cleanup | stored transcripts (`cleanup.json`) | `run.py cleanup` | smoke ~2 s, dev ~15 s, cached ~0 s |
+| Historical cleanup (Haiku) | stored transcripts (`cleanup.json`) | `run.py cleanup` | smoke ~2 s, dev ~15 s, cached ~0 s |
 | Muse | fixed WAV clips (`corpus.json`) | `run.py stt` | ~1 min (real time) |
 | E2E | WAV through the real app | `e2e.sh`, then `run.py e2e-report` | ~1 min per clip and run |
 
-Prompt work happens in the cleanup suite; never use E2E for it.
+Commands below run from the repository root. Use the evaluator and fixed
+transcripts for prompt work rather than the slower desktop E2E loop, but note the
+provider mismatch below before interpreting cleanup results.
 
-## Cleanup
+## Historical cleanup benchmark
+
+**This runner does not verify production cleanup.** The app uses Qwen on
+Cerebras; `run.py cleanup` still calls Haiku through 9Router. It reads the app's
+prompt constant, but its model, endpoint and credential path differ. Passing
+results are not evidence that production cleanup preserves meaning or meets a
+latency target. Align the runner with production before using it as that gate.
+The timings in the table are historical, not performance budgets.
 
 ```sh
 python3 bench/run.py cleanup                                   # smoke: the rapid loop
@@ -21,11 +40,11 @@ python3 bench/run.py cleanup --suite full --effort none low --trials 3 --fresh  
 python3 bench/run.py cleanup --case clause-after-filler-annoying -v
 ```
 
-Transcript → Haiku (the app's exact request body) → deterministic evaluator (`evaluate.py`). No audio, no app, no LLM judge. Requests run concurrently; outputs are cached in `.cache/` keyed by the full request body and trial, so a changed prompt never reuses an old output. `--fresh` bypasses the cache (latency, nondeterminism). `--fail-fast` stops at the first hard failure. The command exits 1 on any hard failure.
+Transcript → historical Haiku request → deterministic evaluator (`evaluate.py`). No audio, no app, no LLM judge. Requests run concurrently; outputs are cached in `.cache/` keyed by the full request body and trial, so a changed prompt never reuses an old output. `--fresh` bypasses the cache (latency, nondeterminism). `--fail-fast` stops at the first hard failure. The command exits 1 on any hard failure.
 
 To change the prompt: edit `CLEANUP_SYSTEM_PROMPT` in `src-tauri/src/providers.rs` (`app` is always read from there), or add a candidate to `prompts.json`. Run smoke, then dev; run holdout only for a promising candidate. Reject a change that improves dev but worsens holdout, and never fix an individual holdout failure in the prompt. Every report row shows the prompt's hash.
 
-Suites: `smoke` (dev cases marked `smoke`), `dev` (prompt-dev), `holdout`, `full` (both). `--effort none` is the app's setting (thinking disabled); `low` and `medium` are adaptive thinking at that effort.
+Suites: `smoke` (dev cases marked `smoke`), `dev` (prompt-dev), `holdout`, `full` (both). `--effort none` disables Haiku thinking; `low` and `medium` are historical Haiku adaptive-thinking comparisons, not production Qwen settings.
 
 ### Cases
 
@@ -63,6 +82,12 @@ python3 bench/run.py record                     # record missing core clips
 ## E2E
 
 `bench/e2e.sh [runs] [clips]`: the real app end to end (null-sink microphone, uinput shortcut, GTK target). Quit the running app first. `VP_STREAMING=0` forces the batch Whisper path. Score with `python3 bench/run.py e2e-report OUT`.
+
+For capture, streaming or delivery changes, compare runs with the same clips,
+settings and build profile. Report release-to-delivery p50/p95, failures and STT
+fallbacks; a faster result that drops text is not an improvement. Cached provider
+outputs cannot establish live latency. Report hardware or live checks that could
+not run separately from the local gate.
 
 ## Other
 

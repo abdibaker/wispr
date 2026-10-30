@@ -181,6 +181,7 @@ fn keysym(c: char) -> String {
 }
 
 const SHIFT: u32 = 1;
+const CTRL: u32 = 4;
 /// Evdev keycodes we remap: only the main block's character keys. Chromium and Electron
 /// derive the DOM `code` from the keycode, so remapping Esc (1), Backspace (14) or Tab (15)
 /// made VS Code and Chrome drop or delete characters. XKB keycode = evdev + 8.
@@ -344,11 +345,13 @@ impl VirtualKeyboard {
         if shift {
             self.keyboard.key(self.time(), 42, 1);
         }
+        self.modifiers(if shift { CTRL | SHIFT } else { CTRL });
         let tapped = self.tap(KEY_V);
         if shift {
             self.keyboard.key(self.time(), 42, 0);
         }
         self.keyboard.key(self.time(), 29, 0);
+        self.modifiers(0);
         self.queue.roundtrip(&mut State)?;
         self.keyboard.destroy();
         self.connection.flush()?;
