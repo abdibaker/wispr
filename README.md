@@ -82,25 +82,43 @@ failure and prints per-stage and total elapsed time.
 Prerequisites: the Linux development packages listed above, Bash, Python 3.9+,
 Rust with `rustfmt` and Clippy, and installed frontend dependencies. Cargo runs
 with `--locked --offline` and reuses its normal build cache. On a fresh checkout,
-prepare dependencies with `pnpm install --frozen-lockfile` and
-`cargo fetch --locked --manifest-path src-tauri/Cargo.toml` before verification.
+or after a dependency bump, prepare dependencies with `pnpm install --frozen-lockfile`
+and `cargo fetch --locked --manifest-path src-tauri/Cargo.toml`. When either is
+missing, the gate prints the command to run and exits 3 before any check: that is
+setup, not a regression.
 
 The gate does not fetch dependencies, call live providers, access API credentials,
 capture audio or send desktop input. It uses local loopback servers in tests.
 It builds `dist/`, but skips release compilation, packaging and live benchmarks.
+GitHub Actions (`.github/workflows/verify.yml`) runs the same gate on pull requests
+and pushes to `main`.
 
 ### Fast iteration
 
-Run only the affected check while editing, then `pnpm verify` before handoff.
-All commands below run from the repository root:
+While editing, run the checks for the files you changed, then `pnpm verify` before
+handoff:
 
-| Changed area | Focused check |
+```sh
+pnpm verify:changed
+```
+
+It reads modified, staged, deleted and untracked files from `git` and runs:
+
+| Changed files | Checks |
 | --- | --- |
-| Rust subsystem | `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib streaming::tests` (replace `streaming` with the affected module) |
-| App orchestration | `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --bin voice-prompt` |
-| TypeScript | `pnpm check` |
-| Cleanup evaluator | `python3 bench/evaluate.py` |
-| Verification script | `python3 scripts/test_verify.py` |
+| `*.md`, `docs/`, `bench/` except `evaluate.py` | none |
+| `src-tauri/src/`, `src-tauri/examples/` | Rust formatting, all-target Clippy, library and binary tests |
+| `src/`, `public/`, `index.html`, `vite.config.ts`, `tsconfig.json` | frontend typecheck and build |
+| `bench/evaluate.py` | evaluator self-check |
+| `scripts/` | verifier self-check |
+| anything else (manifests, lockfiles, `build.rs`, `tauri.conf.json`, `capabilities/`, `protocols/`, `packaging/`, `.github/`) | the full gate |
+
+For a single module, `cargo test --locked --offline --manifest-path src-tauri/Cargo.toml --lib streaming::tests`
+reruns its tests (replace `streaming` with the module).
+
+Changing a struct the frontend receives (`Settings`, history `Entry`, `Microphone`,
+diagnostics) needs the matching type in `src/Settings.tsx` updated by hand: the
+typecheck cannot see the Rust side.
 
 UI changes also need a real-browser or app check. Microphone capture, Wayland
 delivery and live provider quality/latency need separate opt-in checks; passing
