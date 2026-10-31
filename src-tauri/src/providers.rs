@@ -1,9 +1,11 @@
 //! Batch Whisper STT (the streaming fallback) through 9Router and Qwen cleanup on Cerebras,
 //! both OpenAI-compatible APIs.
-use crate::settings::Settings;
+use crate::pipeline::Connect;
+use crate::settings::{secret, Settings};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Where an HTTP call spent its time. `wait_ms` covers upload plus provider processing:
@@ -100,40 +102,39 @@ pub trait PromptCleaner: Send + Sync {
     async fn clean(&self, raw: &str, vocabulary: &[String]) -> Result<Cleaned>;
 }
 
-/// Batch STT and cleanup, injected into the pipeline.
-pub struct Providers {
-    pub stt: Box<dyn SpeechProvider>,
-    pub cleaner: Box<dyn PromptCleaner>,
-}
-
 /// Batch STT for the retained recording when Muse fails.
 // ponytail: the spec's groq/distil-whisper-large-v3-en is decommissioned upstream.
 pub const STT_MODEL: &str = "groq/whisper-large-v3-turbo";
 pub const CLEANUP_MODEL: &str = "qwen-3.8-27b";
 pub const CEREBRAS_URL: &str = "https://api.cerebras.ai/v1";
 
-/// The app's providers: STT through 9Router with `router_key`, cleanup on Cerebras with
-/// `cerebras_key`.
-pub fn connect(
-    client: reqwest::Client,
-    settings: &Settings,
-    router_key: String,
-    cerebras_key: String,
-) -> Providers {
-    Providers {
-        stt: Box::new(OpenAiCompatible {
-            client: client.clone(),
-            base_url: settings.endpoint.clone(),
-            api_key: router_key,
-            model: STT_MODEL.into(),
-            timeout: Duration::from_secs(settings.stt_timeout_secs),
+/// Per-dictation factories; credentials remain in Secret Service until requested.
+pub fn connect(client: reqwest::Client) -> Connect {
+    let cleanup_client = client.clone();
+    Connect {
+        stt: Arc::new(move |settings: &Settings| {
+            let key = secret::get()?.ok_or_else(|| {
+                anyhow::anyhow!("No 9Router API key. Open Voice Prompt settings → Cleanup.")
+            })?;
+            Ok(Box::new(OpenAiCompatible {
+                client: client.clone(),
+                base_url: settings.endpoint.clone(),
+                api_key: key,
+                model: STT_MODEL.into(),
+                timeout: Duration::from_secs(settings.stt_timeout_secs),
+            }))
         }),
-        cleaner: Box::new(OpenAiCompatible {
-            client,
-            base_url: CEREBRAS_URL.into(),
-            api_key: cerebras_key,
-            model: CLEANUP_MODEL.into(),
-            timeout: Duration::from_secs(settings.cleanup_timeout_secs),
+        cleaner: Arc::new(move |settings: &Settings| {
+            let key = secret::get_for(secret::CEREBRAS)?.ok_or_else(|| {
+                anyhow::anyhow!("No Cerebras API key. Open Voice Prompt settings → Cleanup.")
+            })?;
+            Ok(Box::new(OpenAiCompatible {
+                client: cleanup_client.clone(),
+                base_url: CEREBRAS_URL.into(),
+                api_key: key,
+                model: CLEANUP_MODEL.into(),
+                timeout: Duration::from_secs(settings.cleanup_timeout_secs),
+            }))
         }),
     }
 }

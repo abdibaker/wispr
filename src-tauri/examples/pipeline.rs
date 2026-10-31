@@ -14,11 +14,7 @@ async fn main() -> anyhow::Result<()> {
     settings.auto_insert = args.iter().any(|a| a == "--type");
     let dir = tempfile::tempdir()?;
     let client = reqwest::Client::new();
-    let connect = Box::new(move |settings: &settings::Settings| {
-        let key = settings::secret::get()?.ok_or_else(|| anyhow::anyhow!("no API key"))?;
-        let cerebras = settings::secret::get_for(settings::secret::CEREBRAS)?.unwrap_or_default();
-        Ok(providers::connect(client.clone(), settings, key, cerebras))
-    });
+    let connect = providers::connect(client);
     let desktop = delivery::System {
         windows: None,
         keys_held: Box::new(|| false),

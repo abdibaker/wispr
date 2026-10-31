@@ -3,7 +3,7 @@
 //! saved before delivery, and audio whose STT failed is kept for a retry.
 use crate::delivery::{self, Desktop};
 use crate::history::{now_ms, Entry, HistoryStore};
-use crate::providers::{self, Failure, Providers, Transcript};
+use crate::providers::{self, Failure, PromptCleaner, SpeechProvider, Transcript};
 use crate::settings::{self, Settings};
 use crate::streaming::{self, StreamSession};
 use crate::target::Window;
@@ -101,8 +101,20 @@ pub enum Outcome {
     Undelivered(anyhow::Error),
 }
 
-/// Builds the providers for one dictation, reading the API key.
-pub type Connect = Box<dyn Fn(&Settings) -> Result<Providers> + Send + Sync>;
+/// Builds only the requested provider, reading its credential on a blocking worker.
+pub type ProviderFactory<T> = Arc<dyn Fn(&Settings) -> Result<Box<T>> + Send + Sync>;
+
+pub struct Connect {
+    pub stt: ProviderFactory<dyn SpeechProvider>,
+    pub cleaner: ProviderFactory<dyn PromptCleaner>,
+}
+
+fn connect<T: ?Sized + Send + 'static>(
+    factory: ProviderFactory<T>,
+    settings: Settings,
+) -> tokio::task::JoinHandle<Result<Box<T>>> {
+    tokio::task::spawn_blocking(move || factory(&settings))
+}
 
 pub struct Pipeline {
     pub history: Mutex<HistoryStore>,
@@ -159,9 +171,9 @@ impl Pipeline {
         if held.as_millis() < settings.min_hold_ms as u128 || audio::is_silent(&samples) {
             return Ok(Outcome::Ignored);
         }
-        let started = Instant::now();
-        let Providers { stt, cleaner } = (self.connect)(settings)?;
-        latency.keyring_ms = ms(started);
+        let cleaner = settings
+            .cleanup_enabled
+            .then(|| connect(self.connect.cleaner.clone(), settings.clone()));
         stage("transcribing");
         latency.idle_ms = ms(self.last_request.lock().unwrap().unwrap_or(self.started));
 
@@ -197,6 +209,9 @@ impl Pipeline {
                 streamed.model,
             ),
             None => {
+                let started = Instant::now();
+                let stt = connect(self.connect.stt.clone(), settings.clone()).await;
+                latency.keyring_ms += ms(started);
                 let encoding = Instant::now();
                 let wav = providers::wav(&samples, audio::RATE);
                 latency.wav_ms = ms(encoding);
@@ -204,10 +219,12 @@ impl Pipeline {
                     .technical
                     .then(|| settings::vocabulary_hint(&snapshot.vocabulary))
                     .flatten();
-                (
-                    stt.transcribe(wav, &settings.language, hint).await,
-                    providers::STT_MODEL.to_string(),
-                )
+                let result = match stt {
+                    Ok(Ok(stt)) => stt.transcribe(wav, &settings.language, hint).await,
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(error.into()),
+                };
+                (result, providers::STT_MODEL.to_string())
             }
         };
         latency.release_to_stt_ms = Some(ms(released));
@@ -241,8 +258,12 @@ impl Pipeline {
 
         let mut cleanup_error = None;
         let mut cleaned = None;
-        if settings.cleanup_enabled {
+        if let Some(cleaner) = cleaner {
             stage("cleaning");
+            // Count only the remaining wait; setup overlaps streaming or batch transcription.
+            let started = Instant::now();
+            let cleaner = cleaner.await;
+            latency.keyring_ms += ms(started);
             // Only terms the transcript appears to mention, so prose is not rewritten toward them.
             let terms: Vec<String> =
                 settings::relevant_terms(&snapshot.vocabulary, &transcript.text)
@@ -250,7 +271,11 @@ impl Pipeline {
                     .map(String::from)
                     .collect();
             let cleaning = Instant::now();
-            let result = cleaner.clean(&transcript.text, &terms).await;
+            let result = match cleaner {
+                Ok(Ok(cleaner)) => cleaner.clean(&transcript.text, &terms).await,
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(error.into()),
+            };
             latency.cleanup_total_ms = ms(cleaning);
             match result {
                 Ok(result) => {
@@ -561,12 +586,10 @@ mod tests {
         let fake = Stt::default();
         *fake.answers.lock().unwrap() = stt.iter().map(|a| a.map(String::from)).collect();
         let shared = fake.clone();
-        let connect: Connect = Box::new(move |_| {
-            Ok(Providers {
-                stt: Box::new(shared.clone()),
-                cleaner: Box::new(Cleaner(cleaner)),
-            })
-        });
+        let connect = Connect {
+            stt: Arc::new(move |_| Ok(Box::new(shared.clone()))),
+            cleaner: Arc::new(move |_| Ok(Box::new(Cleaner(cleaner)))),
+        };
         let desktop = Arc::new(desktop);
         Rig {
             pipeline: Pipeline::new(history, connect, desktop.clone()),
@@ -624,7 +647,9 @@ mod tests {
     #[tokio::test]
     async fn a_trusted_stream_skips_batch_stt_and_is_attributed() {
         let (snapshot, desktop) = same_window();
-        let rig = rig(&[], Ok("Cleaned."), desktop);
+        let mut rig = rig(&[], Ok("Cleaned."), desktop);
+        rig.pipeline.connect.stt =
+            Arc::new(|_| panic!("streaming must not retrieve the batch key"));
         let stream = streaming::ended(Ok("streamed text"));
         let outcome = rig
             .pipeline
@@ -645,6 +670,117 @@ mod tests {
         assert_eq!(entry.cleanup_model.as_deref(), Some("qwen-3.8-27b"));
         assert_eq!(latency(&rig).stt_mode, "streaming_muse");
         assert_eq!(typed(&rig), ["Cleaned."]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_disabled_never_requests_its_credential() {
+        let (mut snapshot, desktop) = same_window();
+        snapshot.settings.cleanup_enabled = false;
+        let mut rig = rig(&[Ok("batch text"), Ok("retry text")], Ok("unused"), desktop);
+        rig.pipeline.connect.cleaner = Arc::new(|_| panic!("cleanup key must not be read"));
+        for recording in [
+            recording(Some(streaming::ended(Ok("streamed text")))),
+            recording(Some(streaming::ended(Err("disconnected")))),
+            Recording::retry(speech()),
+        ] {
+            let outcome = rig
+                .pipeline
+                .run(&snapshot, recording, |_| {})
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                Outcome::Delivered {
+                    cleanup_failed: false,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(typed(&rig), ["streamed text", "batch text", "retry text"]);
+    }
+
+    #[tokio::test]
+    async fn missing_batch_credentials_preserve_audio_for_fallback_and_retry() {
+        let (mut snapshot, desktop) = same_window();
+        snapshot.settings.cleanup_enabled = false;
+        let mut rig = rig(&[], Ok("unused"), desktop);
+        let worker = std::thread::current().id();
+        rig.pipeline.connect.stt = Arc::new(move |_| {
+            assert_ne!(std::thread::current().id(), worker);
+            Err(anyhow!(
+                "No 9Router API key. Open Voice Prompt settings → Cleanup."
+            ))
+        });
+        let error = rig
+            .pipeline
+            .run(
+                &snapshot,
+                recording(Some(streaming::ended(Err("disconnected")))),
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}")
+            .contains("No 9Router API key. Open Voice Prompt settings → Cleanup."));
+        let samples = rig.pipeline.take_failed_audio().unwrap();
+        assert_eq!(samples, speech());
+        let error = rig
+            .pipeline
+            .run(&snapshot, Recording::retry(samples), |_| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Retry last recording"));
+        assert!(format!("{error:#}")
+            .contains("No 9Router API key. Open Voice Prompt settings → Cleanup."));
+        assert_eq!(rig.pipeline.take_failed_audio().unwrap(), speech());
+        assert_eq!(*rig.stt.calls.lock().unwrap(), 0);
+        assert!(typed(&rig).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_setup_runs_off_worker_and_missing_key_delivers_raw_text() {
+        let (snapshot, desktop) = same_window();
+        let mut rig = rig(&[], Ok("unused"), desktop);
+        let worker = std::thread::current().id();
+        let (send, receive) = std::sync::mpsc::channel();
+        let receive = Mutex::new(receive);
+        rig.pipeline.connect.cleaner = Arc::new(move |_| {
+            assert_ne!(std::thread::current().id(), worker);
+            // Setup must not hold up streaming completion or the async worker.
+            receive
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Err(anyhow!(
+                "No Cerebras API key. Open Voice Prompt settings → Cleanup."
+            ))
+        });
+        let outcome = rig
+            .pipeline
+            .run(
+                &snapshot,
+                recording(Some(streaming::ended(Ok("streamed text")))),
+                |stage| {
+                    if stage == "cleaning" {
+                        send.send(()).unwrap();
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Outcome::Delivered {
+                cleanup_failed: true,
+                ..
+            }
+        ));
+        assert_eq!(typed(&rig), ["streamed text"]);
+        assert_eq!(
+            history(&rig)[0].error.as_deref(),
+            Some("No Cerebras API key. Open Voice Prompt settings → Cleanup.")
+        );
     }
 
     #[tokio::test]

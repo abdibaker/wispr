@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -276,23 +276,6 @@ async fn process(app: &AppHandle, snapshot: &Snapshot, recording: Recording) {
     }
     let _ = app.emit("history-changed", ());
     hide_overlay_later(app, 1600);
-}
-
-/// The app's providers, built per dictation from the stored key.
-fn connect(client: reqwest::Client) -> voice_prompt::pipeline::Connect {
-    Box::new(move |settings| {
-        let key = settings::secret::get()?
-            .ok_or_else(|| anyhow!("No 9Router API key. Open Voice Prompt settings → Cleanup."))?;
-        // Unused with cleanup off, so only required when cleanup runs.
-        let cerebras = match settings::secret::get_for(settings::secret::CEREBRAS)? {
-            Some(key) => key,
-            None if settings.cleanup_enabled => {
-                anyhow::bail!("No Cerebras API key. Open Voice Prompt settings → Cleanup.")
-            }
-            None => String::new(),
-        };
-        Ok(providers::connect(client.clone(), settings, key, cerebras))
-    })
 }
 
 // ---------- commands ----------
@@ -726,7 +709,11 @@ fn main() {
     };
     let state = AppState {
         settings: Mutex::new(settings),
-        pipeline: Pipeline::new(history, connect(client.clone()), Arc::new(desktop)),
+        pipeline: Pipeline::new(
+            history,
+            providers::connect(client.clone()),
+            Arc::new(desktop),
+        ),
         hotkey,
         hotkey_error: Mutex::new(None),
         recording: Mutex::new(None),
