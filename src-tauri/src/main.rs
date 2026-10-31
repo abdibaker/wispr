@@ -184,7 +184,12 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
         }
         HotkeyEvent::Cancelled => {
             if let Some(session) = state.recording.lock().unwrap().take() {
-                drop(session.recording.finish());
+                session.recording.stop();
+                drop(session.stream);
+                tauri::async_runtime::spawn_blocking(move || {
+                    drop(session.recording.finish());
+                    drop(session.busy);
+                });
                 log::info!(
                     "dictation outcome=cancelled held={}",
                     session.pressed.elapsed().as_millis()
@@ -197,34 +202,38 @@ fn on_hotkey(app: &AppHandle, event: HotkeyEvent) {
                 return;
             };
             let released = Instant::now();
-            let mut latency = session.latency;
-            let (samples, first_audio) = session.recording.finish();
-            latency.finish_ms = ms(released);
-            latency.capture_to_first_audio_ms = first_audio.map(|first| {
-                first
-                    .saturating_duration_since(session.capture_started)
-                    .as_millis() as u64
-            });
-            if session.snapshot.settings.sounds {
-                audio::beep(660.0, 60);
-            }
-            let recording = samples.map(|samples| Recording {
-                samples,
-                pressed: Some(session.pressed),
-                released,
-                held: released - session.pressed,
-                stream: session.stream,
-                latency,
-            });
-            let busy = session.busy;
-            let snapshot = session.snapshot;
+            session.recording.stop();
             let app = app.clone();
-            tauri::async_runtime::spawn(async move {
-                match recording {
-                    Ok(recording) => process(&app, &snapshot, recording).await,
-                    Err(error) => report(&app, &error),
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut latency = session.latency;
+                let (samples, first_audio) = session.recording.finish();
+                latency.finish_ms = ms(released);
+                latency.capture_to_first_audio_ms = first_audio.map(|first| {
+                    first
+                        .saturating_duration_since(session.capture_started)
+                        .as_millis() as u64
+                });
+                if session.snapshot.settings.sounds {
+                    audio::beep(660.0, 60);
                 }
-                drop(busy);
+                let recording = samples.map(|samples| Recording {
+                    samples,
+                    pressed: Some(session.pressed),
+                    released,
+                    held: released - session.pressed,
+                    stream: session.stream,
+                    latency,
+                });
+                let busy = session.busy;
+                let snapshot = session.snapshot;
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    match recording {
+                        Ok(recording) => process(&app, &snapshot, recording).await,
+                        Err(error) => report(&app, &error),
+                    }
+                    drop(busy);
+                });
             });
         }
     }

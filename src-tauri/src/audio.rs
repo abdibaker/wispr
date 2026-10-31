@@ -3,15 +3,18 @@ use anyhow::{anyhow, Result};
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::{Context, FlagSet, State};
 use libpulse_binding::def::BufferAttr;
+use libpulse_binding::mainloop::api::Mainloop as _;
+use libpulse_binding::mainloop::events::io::FlagSet as IoFlags;
 use libpulse_binding::mainloop::standard::{IterateResult, Mainloop};
 use libpulse_binding::sample::{Format, Spec};
-use libpulse_binding::stream::Direction;
+use libpulse_binding::stream::{Direction, PeekResult, Stream};
 use libpulse_simple_binding::Simple;
 use serde::Serialize;
 use std::cell::RefCell;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -26,7 +29,7 @@ fn spec() -> Spec {
 }
 
 pub struct Recording {
-    stop: Arc<AtomicBool>,
+    stop: UnixStream,
     handle: JoinHandle<Result<Vec<i16>>>,
     /// When the first chunk of audio arrived (capture latency instrumentation).
     first_sample: Arc<OnceLock<Instant>>,
@@ -40,52 +43,87 @@ impl Recording {
         max_secs: u64,
         mut on_chunk: impl FnMut(&[i16]) + Send + 'static,
     ) -> Result<Self> {
-        let device = (!device.is_empty()).then(|| device.to_string());
-        let chunk_bytes = RATE / 20 * 2;
-        // pipewire-pulse defaults fragsize to ~2 s, delaying the first read (and the level meter) by that much.
-        let attr = BufferAttr {
-            maxlength: u32::MAX,
-            tlength: u32::MAX,
-            prebuf: u32::MAX,
-            minreq: u32::MAX,
-            fragsize: chunk_bytes,
-        };
-        let simple = Simple::new(
-            None,
-            "Voice Prompt",
-            Direction::Record,
-            device.as_deref(),
-            "dictation",
-            &spec(),
-            None,
-            Some(&attr),
-        )
-        .map_err(|e| anyhow!("Microphone unavailable: {e}"))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = stop.clone();
+        let device = device.to_owned();
+        let (stop, wake) = UnixStream::pair()?;
         let first_sample = Arc::new(OnceLock::new());
         let first = first_sample.clone();
+        let (ready, started) = mpsc::sync_channel(1);
         let handle = std::thread::spawn(move || {
-            let mut samples: Vec<i16> = Vec::with_capacity(RATE as usize * 10);
-            let mut chunk = vec![0u8; chunk_bytes as usize];
-            let max = (RATE as u64 * max_secs) as usize;
-            while !stop_flag.load(Ordering::Relaxed) && samples.len() < max {
-                simple
-                    .read(&mut chunk)
-                    .map_err(|e| anyhow!("Microphone read failed: {e}"))?;
-                first.get_or_init(Instant::now);
-                let start = samples.len();
-                samples.extend(
-                    chunk
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|b| i16::from_le_bytes(*b)),
-                );
-                on_chunk(&samples[start..]);
+            let result = capture_loop(wake, |mainloop, stopped| {
+                let mut context = Context::new(mainloop, "Voice Prompt")
+                    .ok_or_else(|| anyhow!("pulse context"))?;
+                context.connect(None, FlagSet::NOFLAGS, None)?;
+                while context.get_state() != State::Ready {
+                    if matches!(context.get_state(), State::Failed | State::Terminated) {
+                        return Err(anyhow!("Cannot connect to audio server"));
+                    }
+                    iterate(mainloop)?;
+                }
+                let mut stream = Stream::new(&mut context, "dictation", &spec(), None)
+                    .ok_or_else(|| anyhow!("pulse recording stream"))?;
+                // Preserve the 50 ms fragment calibration (the server default is about 2 s).
+                let attr = BufferAttr {
+                    maxlength: u32::MAX,
+                    tlength: u32::MAX,
+                    prebuf: u32::MAX,
+                    minreq: u32::MAX,
+                    fragsize: RATE / 20 * 2,
+                };
+                stream.connect_record(
+                    (!device.is_empty()).then_some(device.as_str()),
+                    Some(&attr),
+                    libpulse_binding::stream::FlagSet::NOFLAGS,
+                )?;
+                while stream.get_state() != libpulse_binding::stream::State::Ready {
+                    check_stream(&stream)?;
+                    iterate(mainloop)?;
+                }
+                ready
+                    .send(Ok(()))
+                    .map_err(|_| anyhow!("Capture startup abandoned"))?;
+                let mut samples = Vec::with_capacity(RATE as usize * 10);
+                let max = (RATE as u64 * max_secs) as usize;
+                loop {
+                    check_stream(&stream)?;
+                    let start = samples.len();
+                    match stream.peek()? {
+                        PeekResult::Data(bytes) => {
+                            append_audio(bytes, &mut samples, max, &first);
+                            stream.discard()?;
+                        }
+                        PeekResult::Hole(bytes) => {
+                            samples.resize(start + (bytes / 2).min(max.saturating_sub(start)), 0);
+                            stream.discard()?;
+                        }
+                        PeekResult::Empty => {}
+                    }
+                    if samples.len() > start {
+                        on_chunk(&samples[start..]);
+                    }
+                    // Peek once after the stop wakeup, preserving the final partial fragment.
+                    if samples.len() >= max || (stopped.get() && samples.len() == start) {
+                        break;
+                    }
+                    if samples.len() == start {
+                        iterate(mainloop)?;
+                    }
+                }
+                stream.disconnect()?;
+                context.disconnect();
+                Ok(samples)
+            });
+            if let Err(error) = &result {
+                let _ = ready.send(Err(anyhow!("Microphone unavailable: {error:#}")));
             }
-            Ok(samples)
+            result
         });
+        if let Err(error) = started
+            .recv()
+            .unwrap_or_else(|_| Err(anyhow!("Capture startup failed")))
+        {
+            let _ = handle.join();
+            return Err(error);
+        }
         Ok(Self {
             stop,
             handle,
@@ -93,11 +131,17 @@ impl Recording {
         })
     }
 
+    /// Wakes capture without waiting for audio or joining the worker.
+    pub fn stop(&self) {
+        // Shutdown is idempotent and also wakes a peer that has not started polling yet.
+        let _ = self.stop.shutdown(std::net::Shutdown::Write);
+    }
+
     /// Stops capture and returns the samples plus when the first chunk arrived. The
     /// timestamp is read after the join, so a chunk that arrived during it is not missed;
     /// `None` means no audio arrived at all.
     pub fn finish(self) -> (Result<Vec<i16>>, Option<Instant>) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop();
         let samples = self
             .handle
             .join()
@@ -105,6 +149,52 @@ impl Recording {
             .and_then(|r| r);
         (samples, self.first_sample.get().copied())
     }
+}
+
+fn append_audio(bytes: &[u8], samples: &mut Vec<i16>, max: usize, first: &OnceLock<Instant>) {
+    first.get_or_init(Instant::now);
+    samples.extend(
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(max.saturating_sub(samples.len()))
+            .map(|b| i16::from_le_bytes(*b)),
+    );
+}
+
+fn iterate(mainloop: &mut Mainloop) -> Result<()> {
+    match mainloop.iterate(true) {
+        IterateResult::Success(_) => Ok(()),
+        result => Err(anyhow!("Capture mainloop stopped: {result:?}")),
+    }
+}
+
+fn check_stream(stream: &Stream) -> Result<()> {
+    if matches!(
+        stream.get_state(),
+        libpulse_binding::stream::State::Failed | libpulse_binding::stream::State::Terminated
+    ) {
+        return Err(anyhow!("Microphone stream failed"));
+    }
+    Ok(())
+}
+
+fn capture_loop<T>(
+    wake: UnixStream,
+    run: impl FnOnce(&mut Mainloop, &std::cell::Cell<bool>) -> Result<T>,
+) -> Result<T> {
+    let mut mainloop = Mainloop::new().ok_or_else(|| anyhow!("pulse mainloop"))?;
+    let stopped = Rc::new(std::cell::Cell::new(false));
+    let flag = stopped.clone();
+    let _event = mainloop
+        .new_io_event(
+            wake.as_raw_fd(),
+            IoFlags::INPUT | IoFlags::HANGUP | IoFlags::ERROR,
+            Box::new(move |_, _, _| flag.set(true)),
+        )
+        .ok_or_else(|| anyhow!("capture wake event"))?;
+    run(&mut mainloop, &stopped)
 }
 
 pub fn rms(samples: &[i16]) -> f32 {
@@ -204,6 +294,90 @@ pub fn microphones() -> Result<Vec<Microphone>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_wakes_stalled_capture_and_allows_another_recording() {
+        for cancel in [false, true, false] {
+            let (stop, wake) = UnixStream::pair().unwrap();
+            let (waiting, read_started) = mpsc::sync_channel(1);
+            let (ended, end_of_audio) = mpsc::channel::<()>();
+            let first_sample = Arc::new(OnceLock::new());
+            let first = first_sample.clone();
+            let (done, completed) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let samples = capture_loop(wake, |mainloop, stopped| {
+                    // A partial fragment has arrived; the source then stalls indefinitely.
+                    let samples = vec![12, -34, 56];
+                    first.set(Instant::now()).unwrap();
+                    waiting.send(()).unwrap();
+                    while !stopped.get() {
+                        iterate(mainloop)?;
+                    }
+                    drop(ended);
+                    Ok(samples)
+                });
+                done.send(()).unwrap();
+                samples
+            });
+            let recording = Recording {
+                stop,
+                handle,
+                first_sample,
+            };
+            read_started
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            let release = Instant::now();
+            recording.stop();
+            completed
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("stop must wake capture without another audio fragment");
+            let (samples, first) = recording.finish();
+            assert_eq!(samples.unwrap(), [12, -34, 56]);
+            assert!(first.is_some());
+            assert!(
+                end_of_audio.recv().is_err(),
+                "capture must drop the streaming sink"
+            );
+            eprintln!(
+                "{} stalled capture shutdown: {:?}",
+                if cancel { "cancel" } else { "release" },
+                release.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn partial_fragment_preserves_captured_audio_and_recording_limit() {
+        let first = OnceLock::new();
+        let mut samples = vec![123];
+        append_audio(&[0xfe, 0xff, 0x00, 0x01], &mut samples, 4, &first);
+        let timestamp = *first.get().unwrap();
+        assert_eq!(samples, [123, -2, 256]);
+        append_audio(&[0xff, 0x7f, 0x00, 0x80], &mut samples, 4, &first);
+        assert_eq!(samples, [123, -2, 256, 32767]);
+        assert_eq!(first.get(), Some(&timestamp));
+    }
+
+    #[test]
+    fn stop_before_poll_is_not_lost() {
+        let (stop, wake) = UnixStream::pair().unwrap();
+        stop.shutdown(std::net::Shutdown::Write).unwrap();
+        let (done, completed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            capture_loop(wake, |mainloop, stopped| {
+                iterate(mainloop)?;
+                assert!(stopped.get());
+                Ok(())
+            })
+            .unwrap();
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        worker.join().unwrap();
+    }
 
     #[test]
     fn silence_detection() {
