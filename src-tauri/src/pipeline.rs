@@ -511,11 +511,13 @@ mod tests {
     struct Stt {
         answers: Arc<Mutex<Vec<Result<String, &'static str>>>>,
         calls: Arc<Mutex<u32>>,
+        recordings: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     #[async_trait]
     impl SpeechProvider for Stt {
-        async fn transcribe(&self, _: Vec<u8>, _: &str, _: Option<String>) -> Result<Transcript> {
+        async fn transcribe(&self, wav: Vec<u8>, _: &str, _: Option<String>) -> Result<Transcript> {
+            self.recordings.lock().unwrap().push(wav);
             *self.calls.lock().unwrap() += 1;
             let answer = self.answers.lock().unwrap().remove(0);
             answer
@@ -661,6 +663,68 @@ mod tests {
         let entry = &history(&rig)[0];
         assert_eq!(entry.raw, "batch text");
         assert_eq!(entry.stt_model, "groq/whisper-large-v3-turbo");
+    }
+
+    #[tokio::test]
+    async fn streaming_timeouts_fall_back_to_the_complete_recording() {
+        for reason in ["drain_timeout", "connect_timeout", "finalize_timeout"] {
+            let (snapshot, desktop) = same_window();
+            let rig = rig(&[Ok("batch text")], Ok("Cleaned."), desktop);
+            rig.pipeline
+                .run(
+                    &snapshot,
+                    recording(Some(streaming::ended(Err(reason)))),
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(latency(&rig).fallback_reason, reason);
+            assert_eq!(latency(&rig).stt_mode, "batch_fallback");
+            assert_eq!(history(&rig)[0].raw, "batch text");
+            assert_eq!(
+                *rig.stt.recordings.lock().unwrap(),
+                [providers::wav(&speech(), audio::RATE)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_timeouts_replay_all_audio_and_preserve_failed_recordings_for_retry() {
+        for reason in ["drain_timeout", "connect_timeout", "finalize_timeout"] {
+            let (snapshot, desktop) = same_window();
+            let rig = rig(
+                &[Err("batch failed"), Ok("recovered text")],
+                Ok("Cleaned."),
+                desktop,
+            );
+            let stream = streaming::ended(Err(reason));
+            assert!(rig
+                .pipeline
+                .run(&snapshot, recording(Some(stream)), |_| {})
+                .await
+                .is_err());
+            assert!(history(&rig).is_empty());
+            assert!(typed(&rig).is_empty());
+            assert_eq!(
+                *rig.stt.recordings.lock().unwrap(),
+                [providers::wav(&speech(), audio::RATE)]
+            );
+            let samples = rig.pipeline.take_failed_audio().unwrap();
+            assert_eq!(samples, speech());
+            rig.pipeline
+                .run(&snapshot, Recording::retry(samples), |_| {})
+                .await
+                .unwrap();
+            assert_eq!(history(&rig)[0].raw, "recovered text");
+            assert!(rig.pipeline.take_failed_audio().is_none());
+            assert_eq!(
+                *rig.stt.recordings.lock().unwrap(),
+                [
+                    providers::wav(&speech(), audio::RATE),
+                    providers::wav(&speech(), audio::RATE)
+                ]
+            );
+        }
     }
 
     #[tokio::test]

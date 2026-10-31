@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{http::StatusCode, Message};
 
 /// Audio held while the token and socket are set up: 10 s of 16 kHz PCM16. Past it the
@@ -32,6 +32,8 @@ const MUSE_MAX_KEYWORD_CHARS: usize = 20;
 /// Muse's final after endStream normally takes a few hundred ms; past this the session is
 /// untrusted and the retained recording goes to batch STT.
 const FINALIZE_DEADLINE: Duration = Duration::from_secs(3);
+// Remaining setup plus at most 10 s of queued audio needs its own bounded window.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Why streaming produced no trusted transcript; logged as `fallback_reason`.
 #[derive(Debug)]
@@ -108,6 +110,7 @@ pub struct StreamSession {
     /// Attribution for history: `meta/muse-voice-transcribe-1.0`.
     model: String,
     task: tauri::async_runtime::JoinHandle<Result<String>>,
+    finalized: oneshot::Receiver<tokio::time::Instant>,
     stopped: Arc<AtomicBool>,
     overflowed: Arc<AtomicBool>,
     stats: Arc<Mutex<Stats>>,
@@ -145,19 +148,39 @@ impl StreamSession {
         Conclusion { transcript, stats }
     }
 
-    /// The complete transcript, once the provider confirms the session finished. Call after the
-    /// sink is dropped; fails at `deadline` rather than returning partial text.
-    async fn finish(mut self, deadline: Duration) -> Result<String> {
+    /// Call after the sink is dropped. Setup and drain are bounded separately from the
+    /// response deadline, which starts when endStream has actually been sent.
+    async fn finish(self, deadline: Duration) -> Result<String> {
+        self.finish_with_drain_deadline(DRAIN_DEADLINE, deadline)
+            .await
+    }
+
+    async fn finish_with_drain_deadline(
+        mut self,
+        drain: Duration,
+        response: Duration,
+    ) -> Result<String> {
         if self.overflowed.load(Ordering::SeqCst) {
             return Err(fail("queue_overflow", "Streaming queue overflowed"));
         }
-        match tokio::time::timeout(deadline, &mut self.task).await {
-            Err(_) => Err(fail(
-                "finalize_timeout",
-                "Live transcription did not finish in time",
+        let result = tokio::select! {
+            biased;
+            result = &mut self.task => result,
+            sent = &mut self.finalized => {
+                match sent {
+                    Ok(sent) => tokio::time::timeout_at(sent + response, &mut self.task)
+                        .await
+                        .map_err(|_| fail("finalize_timeout", "Live transcription did not finish in time"))?,
+                    Err(_) => (&mut self.task).await,
+                }
+            }
+            _ = tokio::time::sleep(drain) => return Err(fail(
+                "drain_timeout", "Live transcription setup or upload did not finish in time",
             )),
-            Ok(Err(_)) => Err(fail("task", "Streaming task stopped")),
-            Ok(Ok(result)) => result,
+        };
+        match result {
+            Err(_) => Err(fail("task", "Streaming task stopped")),
+            Ok(result) => result,
         }
     }
 }
@@ -199,6 +222,7 @@ struct Audio {
     receiver: mpsc::UnboundedReceiver<Vec<u8>>,
     queued: Arc<AtomicUsize>,
     stats: Arc<Mutex<Stats>>,
+    finalized: oneshot::Sender<tokio::time::Instant>,
 }
 
 impl Audio {
@@ -217,6 +241,7 @@ where
     Fut: Future<Output = Result<String>> + Send + 'static,
 {
     let (sender, receiver) = mpsc::unbounded_channel();
+    let (finalized_sender, finalized) = oneshot::channel();
     let queued = Arc::new(AtomicUsize::new(0));
     let stopped = Arc::new(AtomicBool::new(false));
     let overflowed = Arc::new(AtomicBool::new(false));
@@ -225,11 +250,13 @@ where
         receiver,
         queued: queued.clone(),
         stats: stats.clone(),
+        finalized: finalized_sender,
     }));
     (
         StreamSession {
             model: format!("meta/{MUSE_MODEL}"),
             task,
+            finalized,
             stopped: stopped.clone(),
             overflowed: overflowed.clone(),
             stats,
@@ -397,6 +424,8 @@ async fn muse(
             .await
             .map_err(|_| fail("disconnected", "Muse connection lost while finalizing"))?;
         mark(&stats, |s| &mut s.finalize_sent);
+        // Cancellation can drop the receiver just as the upload completes.
+        let _ = audio.finalized.send(tokio::time::Instant::now());
         Ok::<(), anyhow::Error>(())
     };
     let receive = async {
@@ -670,6 +699,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_handshake_and_long_upload_finish_before_the_response_deadline_starts() {
+        let (url, server) = muse_server(
+            |_| None,
+            |mut socket| async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                socket
+                    .send(accept(serde_json::Value::Null).unwrap())
+                    .await
+                    .unwrap();
+                let audio = audio_until_end(&mut socket).await;
+                let expected: Vec<i16> = (0..140).flat_map(chunk).collect();
+                assert_eq!(samples_of(&audio), expected);
+                socket
+                    .send(muse_transcript("Complete streamed transcript.", true))
+                    .await
+                    .unwrap();
+                socket.send(close(1000)).await.unwrap();
+            },
+        )
+        .await;
+        let (session, sink) = muse_session(muse_key_after(Duration::ZERO), url, &[]);
+        for i in 0..140 {
+            sink.push(&chunk(i));
+        }
+        drop(sink);
+        let started = Instant::now();
+        let conclusion = session.conclude().await;
+        assert_eq!(
+            conclusion.transcript.unwrap().text,
+            "Complete streamed transcript."
+        );
+        let stats = conclusion.stats;
+        assert!(
+            stats
+                .finalize_sent
+                .unwrap()
+                .duration_since(stats.ready.unwrap())
+                >= Duration::from_secs(4)
+        );
+        assert!(started.elapsed() > FINALIZE_DEADLINE);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn muse_close_without_final_fails_without_partial_text() {
         for code in [Some(1000), None] {
             let (url, server) = muse_server(accept, move |mut socket| async move {
@@ -784,6 +857,73 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(reason(&error), "finalize_timeout");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_setup_is_bounded_even_when_the_key_never_arrives() {
+        let (session, sink) = muse_session(
+            Box::pin(std::future::pending()),
+            "ws://127.0.0.1:9/".into(),
+            &[],
+        );
+        sink.push(&chunk(1));
+        drop(sink);
+        let started = Instant::now();
+        let error = session
+            .finish_with_drain_deadline(Duration::from_millis(100), FINALIZE_DEADLINE)
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "drain_timeout");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn stalled_upload_is_bounded_and_cancels_the_provider_task() {
+        let (started_sender, started) = oneshot::channel();
+        let (cancelled_sender, cancelled) = oneshot::channel::<()>();
+        let (session, sink) = spawn(|mut audio| async move {
+            // Hold the provider at the upload await, independently of OS socket buffers.
+            let _cancelled = cancelled_sender;
+            assert!(audio.next().await.is_some());
+            started_sender.send(()).unwrap();
+            std::future::pending::<Result<String>>().await
+        });
+        sink.push(&chunk(1));
+        drop(sink);
+        started.await.unwrap();
+        let error = session
+            .finish_with_drain_deadline(Duration::from_millis(100), FINALIZE_DEADLINE)
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "drain_timeout");
+        assert!(tokio::time::timeout(Duration::from_secs(1), cancelled)
+            .await
+            .unwrap()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn partial_text_does_not_extend_the_final_response_deadline() {
+        let (url, server) = muse_server(accept, |mut socket| async move {
+            audio_until_end(&mut socket).await;
+            socket
+                .send(muse_transcript("Do not trust these words", false))
+                .await
+                .unwrap();
+            while socket.next().await.is_some() {}
+        })
+        .await;
+        let (session, sink) = muse_session(muse_key_after(Duration::ZERO), url, &[]);
+        sink.push(&chunk(1));
+        drop(sink);
+        let stats = session.stats.clone();
+        let error = session
+            .finish(Duration::from_millis(150))
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "finalize_timeout");
+        assert!(stats.lock().unwrap().first_partial.is_some());
         server.await.unwrap();
     }
 
