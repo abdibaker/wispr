@@ -153,26 +153,83 @@ pub fn output_budget(raw: &str) -> u32 {
     (raw.len() / 2 + 512) as u32
 }
 
-/// Turns HTTP failures into actionable messages without echoing request contents or `key`.
-async fn check(response: reqwest::Response, key: &str) -> Result<reqwest::Response> {
+/// Turns HTTP failures into actionable messages without echoing sensitive request fields.
+async fn check(mut response: reqwest::Response, sensitive: &[&str]) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
-    let body = response.text().await.unwrap_or_default();
-    let detail: String = body.replace(key, "[redacted]").chars().take(300).collect();
+    match status.as_u16() {
+        401 | 403 => {
+            return Err(fail(
+                Failure::Http,
+                format!("The provider rejected the API key ({status}). Update it in Settings."),
+            ))
+        }
+        429 => {
+            return Err(fail(
+                Failure::RateLimited,
+                format!("Rate limited by provider ({status}). Try again shortly."),
+            ))
+        }
+        _ => {}
+    }
+    let mut prefix = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    while prefix.len() < 1200 {
+        match tokio::time::timeout_at(deadline, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                let length = chunk.len().min(1200 - prefix.len());
+                prefix.extend_from_slice(&chunk[..length]);
+            }
+            // Diagnostics are best-effort; preserve the HTTP status on timeout/read failure.
+            _ => break,
+        }
+    }
+    drop(response);
+    // Providers can echo either decoded fields or their JSON-escaped request representation.
+    let sensitive: Vec<String> = sensitive
+        .iter()
+        .filter(|value| !value.is_empty())
+        .flat_map(|value| {
+            let json = serde_json::to_string(value).expect("strings serialize to JSON");
+            [value.to_string(), json[1..json.len() - 1].to_string()]
+        })
+        .collect();
+    // Redact bytes before decoding: the cutoff can split UTF-8 or a credential.
+    let mut redacted = Vec::new();
+    let mut offset = 0;
+    while offset < prefix.len() {
+        let rest = &prefix[offset..];
+        let hidden = sensitive
+            .iter()
+            .filter(|value| !value.is_empty())
+            .find_map(|value| {
+                let bytes = value.as_bytes();
+                if rest.starts_with(bytes) {
+                    Some(bytes.len())
+                } else if bytes.starts_with(rest) {
+                    Some(rest.len())
+                } else {
+                    None
+                }
+            });
+        if let Some(length) = hidden {
+            redacted.extend_from_slice(b"[redacted]");
+            offset += length;
+        } else {
+            redacted.push(prefix[offset]);
+            offset += 1;
+        }
+    }
+    let detail: String = String::from_utf8_lossy(&redacted)
+        .chars()
+        .take(300)
+        .collect();
     Err(match status.as_u16() {
-        401 | 403 => fail(
-            Failure::Http,
-            format!("The provider rejected the API key ({status}). Update it in Settings."),
-        ),
         404 => fail(
             Failure::Http,
             format!("Endpoint or model not found ({status}): {detail}"),
-        ),
-        429 => fail(
-            Failure::RateLimited,
-            format!("Rate limited by provider ({status}). Try again shortly."),
         ),
         _ => fail(Failure::Http, format!("Provider error {status}: {detail}")),
     })
@@ -216,8 +273,8 @@ impl SpeechProvider for OpenAiCompatible {
         if !language.is_empty() && language != "auto" {
             form = form.text("language", language.to_string());
         }
-        if let Some(hint) = hint {
-            form = form.text("prompt", hint);
+        if let Some(hint) = &hint {
+            form = form.text("prompt", hint.clone());
         }
         let request = self
             .client
@@ -233,7 +290,11 @@ impl SpeechProvider for OpenAiCompatible {
             ..Default::default()
         };
         let sent = Instant::now();
-        let response = check(request.send().await.map_err(network_error)?, &self.api_key).await?;
+        let response = check(
+            request.send().await.map_err(network_error)?,
+            &[&self.api_key, hint.as_deref().unwrap_or("")],
+        )
+        .await?;
         timing.wait_ms = ms(sent);
         let received = Instant::now();
         let bytes = response.bytes().await.map_err(network_error)?;
@@ -323,7 +384,11 @@ impl PromptCleaner for OpenAiCompatible {
                 Err(error) if attempts == 1 && !error.is_timeout() && error.is_request() => {
                     log::debug!("cleanup request failed, retrying once: {error}");
                 }
-                result => break check(result.map_err(network_error)?, &self.api_key).await?,
+                result => {
+                    let mut sensitive = vec![self.api_key.as_str(), raw, CLEANUP_SYSTEM_PROMPT];
+                    sensitive.extend(vocabulary.iter().map(String::as_str));
+                    break check(result.map_err(network_error)?, &sensitive).await?;
+                }
             }
         };
         let received = Instant::now();
@@ -540,6 +605,197 @@ mod tests {
             }
         });
         (url, bodies)
+    }
+
+    /// Sends headers and a prefix, then waits for the client to release the response.
+    async fn slow_body(status: u16, prefix: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 8192];
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buffer[..n]);
+                if let Some(end) = request.windows(4).position(|s| s == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|value| value.parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let length = if status == 200 {
+                prefix.len()
+            } else {
+                10_000_000
+            };
+            let headers = format!(
+                "HTTP/1.1 {status} X\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n"
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            let split = prefix.len().min(15);
+            socket.write_all(&prefix[..split]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            socket.write_all(&prefix[split..]).await.unwrap();
+            // The unfinished body must be dropped, not drained for connection reuse.
+            assert_eq!(socket.read(&mut buffer).await.unwrap(), 0);
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn actionable_statuses_do_not_wait_for_error_bodies() {
+        for (status, kind, message) in [
+            (401, Failure::Http, "Update it in Settings"),
+            (403, Failure::Http, "Update it in Settings"),
+            (429, Failure::RateLimited, "Try again shortly"),
+        ] {
+            let (url, released) = slow_body(status, Vec::new()).await;
+            let error = tokio::time::timeout(
+                Duration::from_millis(300),
+                cleaner(&url).clean("private transcript", &[]),
+            )
+            .await
+            .expect("status must not await the body")
+            .err()
+            .unwrap();
+            assert_eq!(Failure::of(&error), Some(kind));
+            assert!(error.to_string().contains(message), "{error}");
+            tokio::time::timeout(Duration::from_secs(1), released)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn other_errors_bound_diagnostics_and_release_unfinished_bodies() {
+        for (status, prefix, expected) in [
+            (404, b"model unavailable".to_vec(), "model unavailable"),
+            (500, vec![b'x'; 100_000], "xxx"),
+            (503, Vec::new(), "Provider error"),
+        ] {
+            let (url, released) = slow_body(status, prefix).await;
+            let error = tokio::time::timeout(
+                Duration::from_millis(400),
+                cleaner(&url).clean("private transcript", &[]),
+            )
+            .await
+            .expect("diagnostics must be bounded")
+            .err()
+            .unwrap();
+            assert_eq!(Failure::of(&error), Some(Failure::Http));
+            let message = error.to_string();
+            assert!(message.contains(expected), "{message}");
+            assert!(message.chars().count() < 400);
+            tokio::time::timeout(Duration::from_secs(1), released)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_cutoffs_do_not_expose_partial_credentials_or_transcripts() {
+        for (prefix, expected) in [
+            (
+                [vec![b'x'; 1194], b"secret".to_vec()].concat(),
+                "[redacted]",
+            ),
+            ([vec![b' '; 295], b"secret-abc".to_vec()].concat(), "[reda"),
+            (b"echo private transcript".to_vec(), "echo [redacted]"),
+            (b"invalid key secret-abc".to_vec(), "invalid key [redacted]"),
+        ] {
+            let (url, released) = slow_body(500, prefix).await;
+            let mut provider = cleaner(&url);
+            provider.api_key = "secret-abc".into();
+            let message = provider
+                .clean("private transcript", &[])
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(!message.contains("secret"), "{message}");
+            assert!(!message.contains("private transcript"), "{message}");
+            // The byte cutoff's redaction is outside the 300-character display window.
+            if !message.contains('x') {
+                assert!(message.contains(expected), "{message}");
+            }
+            tokio::time::timeout(Duration::from_secs(1), released)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // A long key beginning at byte zero crosses the byte cutoff inside the display window.
+        let (url, released) = slow_body(500, vec![b's'; 1200]).await;
+        let mut provider = cleaner(&url);
+        provider.api_key = "s".repeat(1300);
+        let message = provider
+            .clean("private transcript", &[])
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(message.ends_with(": [redacted]"), "{message}");
+        tokio::time::timeout(Duration::from_secs(1), released)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stt_success_and_errors_preserve_the_provider_contract() {
+        for (status, body) in [
+            (200, r#"{"text":" full transcript "}"#),
+            (401, ""),
+            (500, "invalid key secret-abc; hint private hint"),
+        ] {
+            let (url, released) = slow_body(status, body.as_bytes().to_vec()).await;
+            let mut provider = cleaner(&url);
+            provider.api_key = "secret-abc".into();
+            let result = provider
+                .transcribe(wav(&[1, 2], 16000), "en", Some("private hint".into()))
+                .await;
+            if status == 200 {
+                assert_eq!(result.unwrap().text, "full transcript");
+            } else {
+                let error = result.err().unwrap();
+                assert_eq!(Failure::of(&error), Some(Failure::Http));
+                assert!(!error.to_string().contains("secret-abc"));
+                assert!(!error.to_string().contains("private hint"));
+            }
+            tokio::time::timeout(Duration::from_secs(1), released)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn json_escaped_transcripts_are_redacted() {
+        let (url, _) = server(vec![Some((
+            500,
+            serde_json::json!({"error": "private\ntranscript"}),
+        ))])
+        .await;
+        let error = cleaner(&url)
+            .clean("private\ntranscript", &[])
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("[redacted]"), "{error}");
+        assert!(!error.to_string().contains("private"), "{error}");
     }
 
     fn cleaner(url: &str) -> OpenAiCompatible {
